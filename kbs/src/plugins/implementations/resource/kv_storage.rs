@@ -44,10 +44,7 @@ impl StorageBackend for KvStorage {
             resource_desc.repository_name, resource_desc.resource_type, resource_desc.resource_tag
         );
 
-        let deleted = self.storage.delete(&ref_resource_path).await?;
-        if deleted.is_none() {
-            bail!("resource not found: {}", ref_resource_path);
-        }
+        let _ = self.storage.delete(&ref_resource_path).await?;
 
         Ok(())
     }
@@ -93,5 +90,25 @@ mod tests {
             .expect("read secret resource failed");
 
         assert_eq!(&data[..], TEST_DATA);
+    }
+
+    #[tokio::test]
+    async fn delete_missing_resource_is_idempotent() {
+        let storage = KeyValueStorageStructConfig::default()
+            .to_client_with_namespace(KeyValueStorageType::Memory, RESOURCE_STORAGE_NAMESPACE)
+            .await
+            .expect("create key value storage failed");
+
+        let local_fs = KvStorage::new(storage);
+        let resource_desc = ResourceDesc {
+            repository_name: "default".into(),
+            resource_type: "test".into(),
+            resource_tag: "missing".into(),
+        };
+
+        local_fs
+            .delete_secret_resource(resource_desc)
+            .await
+            .expect("delete of missing resource should be a no-op");
     }
 }

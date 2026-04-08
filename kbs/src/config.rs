@@ -54,6 +54,13 @@ impl Default for HttpServerConfig {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Default)]
+#[serde(default)]
+pub struct PolicyEngineConfig {
+    /// Path to a Rego policy file to load at startup.
+    pub policy_path: Option<PathBuf>,
+}
+
 /// Contains all configurable KBS properties.
 #[derive(Debug, Clone, Deserialize, PartialEq, Default)]
 pub struct KbsConfig {
@@ -71,6 +78,10 @@ pub struct KbsConfig {
 
     /// Configuration for the KBS admin API
     pub admin: AdminConfig,
+
+    /// Configuration for the KBS resource policy engine.
+    #[serde(default)]
+    pub policy_engine: PolicyEngineConfig,
 
     /// Unified storage backend configuration for all storage needs in KBS.
     /// When provided, this will be used to create storage instances for:
@@ -120,7 +131,8 @@ mod tests {
             AdminBackendType, AdminConfig,
         },
         config::{
-            HttpServerConfig, DEFAULT_INSECURE_HTTP, DEFAULT_PAYLOAD_REQUEST_SIZE, DEFAULT_SOCKET,
+            HttpServerConfig, PolicyEngineConfig, DEFAULT_INSECURE_HTTP,
+            DEFAULT_PAYLOAD_REQUEST_SIZE, DEFAULT_SOCKET,
         },
         plugins::{
             implementations::{RepositoryConfig, SampleConfig},
@@ -173,6 +185,9 @@ mod tests {
         admin: AdminConfig {
             admin_backend: AdminBackendType::DenyAll,
             roles: Vec::new(),
+        },
+        policy_engine: PolicyEngineConfig {
+            policy_path: Some("/opt/confidential-containers/opa/policy.rego".into()),
         },
         storage_backend: StorageBackendConfig {
             storage_type: KeyValueStorageType::LocalJson,
@@ -227,6 +242,7 @@ mod tests {
             admin_backend: AdminBackendType::DenyAll,
             roles: Vec::new(),
         },
+        policy_engine: PolicyEngineConfig::default(),
         storage_backend: StorageBackendConfig {
             storage_type: KeyValueStorageType::LocalJson,
             backends: KeyValueStorageStructConfig {
@@ -272,6 +288,7 @@ mod tests {
             admin_backend: AdminBackendType::DenyAll,
             roles: Vec::new(),
         },
+        policy_engine: PolicyEngineConfig::default(),
         storage_backend: StorageBackendConfig {
             storage_type: KeyValueStorageType::LocalJson,
             backends: KeyValueStorageStructConfig {
@@ -319,6 +336,7 @@ mod tests {
             }),
             roles: Vec::new(),
         },
+        policy_engine: PolicyEngineConfig::default(),
         storage_backend: StorageBackendConfig {
             storage_type: KeyValueStorageType::LocalJson,
             backends: KeyValueStorageStructConfig {
@@ -365,6 +383,7 @@ mod tests {
             admin_backend: AdminBackendType::InsecureAllowAll,
             roles: Vec::new(),
         },
+        policy_engine: PolicyEngineConfig::default(),
         storage_backend: StorageBackendConfig {
             storage_type: KeyValueStorageType::Memory,
             backends: KeyValueStorageStructConfig {
@@ -408,6 +427,7 @@ mod tests {
             admin_backend: AdminBackendType::DenyAll,
             roles: Vec::new(),
         },
+        policy_engine: PolicyEngineConfig::default(),
         storage_backend: StorageBackendConfig::default(),
         plugins: Vec::new(),
     })]
@@ -434,6 +454,7 @@ mod tests {
             admin_backend: AdminBackendType::DenyAll,
             roles: Vec::new(),
         },
+        policy_engine: PolicyEngineConfig::default(),
         storage_backend: StorageBackendConfig::default(),
         plugins: Vec::new(),
     })]
@@ -466,6 +487,7 @@ mod tests {
             admin_backend: AdminBackendType::DenyAll,
             roles: Vec::new(),
         },
+        policy_engine: PolicyEngineConfig::default(),
         storage_backend: StorageBackendConfig::default(),
         plugins: Vec::new(),
     })]
@@ -501,6 +523,7 @@ mod tests {
             }),
             roles: Vec::new(),
         },
+        policy_engine: PolicyEngineConfig::default(),
         storage_backend: StorageBackendConfig {
             storage_type: KeyValueStorageType::LocalJson,
             backends: KeyValueStorageStructConfig {

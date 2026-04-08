@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::collections::HashMap;
+use std::fs;
 
 use actix_web::{
     http::{header::Header, Method},
@@ -61,6 +62,18 @@ pub struct ApiServer {
 }
 
 impl ApiServer {
+    fn startup_policy(config: &KbsConfig) -> Result<String> {
+        if let Some(policy_path) = &config.policy_engine.policy_path {
+            return fs::read_to_string(policy_path)
+                .with_context(|| {
+                    format!("failed to read policy file from {}", policy_path.display())
+                })
+                .map_err(|source| Error::PolicyInitializationFailed { source });
+        }
+
+        Ok(include_str!("../sample_policies/default.rego").to_string())
+    }
+
     async fn get_attestation_token(&self, request: &HttpRequest) -> anyhow::Result<String> {
         #[cfg(feature = "as")]
         if let Ok(token) = self
@@ -93,13 +106,10 @@ impl ApiServer {
             .await
             .map_err(|e| Error::StorageBackendInitialization { source: e })?;
         let policy_engine = PolicyEngine::new(policy_storage_backend);
+        let startup_policy = Self::startup_policy(&config)?;
 
         policy_engine
-            .set_policy(
-                KBS_POLICY_ID,
-                include_str!("../sample_policies/default.rego"),
-                false,
-            )
+            .set_policy(KBS_POLICY_ID, &startup_policy, true)
             .await?;
         let admin = Admin::try_from(config.admin.clone())?;
 
@@ -500,7 +510,7 @@ pub(crate) async fn workload_resource_api(
 
     // Evaluate OPA policy (same pattern as existing api() handler)
     KBS_POLICY_EVALS.inc();
-    if !core
+    let policy_result = core
         .policy_engine
         .evaluate_rego(
             Some(&policy_data_str),
@@ -510,7 +520,8 @@ pub(crate) async fn workload_resource_api(
             vec![],
         )
         .await
-        .inspect_err(|_| KBS_POLICY_ERRORS.inc())?
+        .inspect_err(|_| KBS_POLICY_ERRORS.inc())?;
+    let allowed = policy_result
         .eval_rules_result
         .get(KBS_POLICY_RULE)
         .expect("`data.policy.allow` rule not put as parameter found")
@@ -527,8 +538,15 @@ pub(crate) async fn workload_resource_api(
             warn!("`{KBS_POLICY_RULE}` rule result is not a boolean, use false as default");
             KBS_POLICY_ERRORS.inc();
             false
-        })
-    {
+        });
+    if !allowed {
+        warn!(
+            method = %method,
+            path = %path,
+            policy_data = %policy_data_str,
+            claims = %claim_str,
+            "workload_resource_api denied by policy"
+        );
         KBS_POLICY_VIOLATIONS.inc();
         return Err(Error::PolicyDeny);
     }
@@ -622,7 +640,11 @@ mod workload_resource_tests {
         // 2-segment path should be invalid
         let path = "default/seed-encrypted";
         let path_parts: Vec<&str> = path.split('/').collect();
-        assert_ne!(path_parts.len(), 3, "2-segment path should not have 3 parts");
+        assert_ne!(
+            path_parts.len(),
+            3,
+            "2-segment path should not have 3 parts"
+        );
     }
 
     #[test]
@@ -667,7 +689,8 @@ mod workload_resource_tests {
 
     #[test]
     fn test_workload_resource_policy_data_shape() {
-        let policy_data = build_workload_policy_data("PUT", &["default", "test-owner", "seed-encrypted"]);
+        let policy_data =
+            build_workload_policy_data("PUT", &["default", "test-owner", "seed-encrypted"]);
 
         assert_eq!(
             policy_data["plugin"], "workload-resource",
@@ -687,15 +710,13 @@ mod workload_resource_tests {
         assert_eq!(resource_path[2], "seed-encrypted");
 
         // query must be an empty object
-        assert!(
-            policy_data["query"].is_object(),
-            "query must be an object"
-        );
+        assert!(policy_data["query"].is_object(), "query must be an object");
     }
 
     #[test]
     fn test_workload_resource_policy_data_delete() {
-        let policy_data = build_workload_policy_data("DELETE", &["default", "test-owner", "seed-encrypted"]);
+        let policy_data =
+            build_workload_policy_data("DELETE", &["default", "test-owner", "seed-encrypted"]);
         assert_eq!(policy_data["method"], "DELETE");
         assert_eq!(policy_data["plugin"], "workload-resource");
     }
@@ -709,7 +730,11 @@ mod workload_resource_tests {
         } else {
             method
         };
-        assert_eq!(dispatch_method, Method::POST, "PUT must map to POST for plugin dispatch");
+        assert_eq!(
+            dispatch_method,
+            Method::POST,
+            "PUT must map to POST for plugin dispatch"
+        );
     }
 
     #[test]
@@ -721,6 +746,10 @@ mod workload_resource_tests {
         } else {
             method.clone()
         };
-        assert_eq!(dispatch_method, Method::DELETE, "DELETE must remain DELETE for plugin dispatch");
+        assert_eq!(
+            dispatch_method,
+            Method::DELETE,
+            "DELETE must remain DELETE for plugin dispatch"
+        );
     }
 }

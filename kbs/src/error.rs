@@ -16,6 +16,12 @@ const ERROR_TYPE_PREFIX: &str = "https://github.com/confidential-containers/kbs/
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+fn plugin_internal_error_is_not_found(source: &anyhow::Error) -> bool {
+    source
+        .chain()
+        .any(|err| err.to_string().contains("resource not found:"))
+}
+
 #[derive(Error, AsRefStr, Debug)]
 pub enum Error {
     #[error("Admin auth error: {0}")]
@@ -73,6 +79,12 @@ pub enum Error {
         source: anyhow::Error,
     },
 
+    #[error("Policy initialization failed: {source}")]
+    PolicyInitializationFailed {
+        #[source]
+        source: anyhow::Error,
+    },
+
     #[error("Policy engine error: {0}")]
     PolicyEngineError(#[from] policy_engine::PolicyError),
 
@@ -103,10 +115,16 @@ pub enum Error {
 
 impl ResponseError for Error {
     fn error_response(&self) -> HttpResponse {
-        let mut detail = String::new();
+        let detail_source = match self {
+            Error::PluginInternalError { source } if plugin_internal_error_is_not_found(source) => {
+                source.to_string()
+            }
+            _ => self.to_string(),
+        };
 
         // The write macro here will only raise error when OOM of the string.
-        write!(&mut detail, "{}", self).expect("Failed to write error");
+        let mut detail = String::new();
+        write!(&mut detail, "{detail_source}").expect("Failed to write error");
         let info = ErrorInformation {
             error_type: format!("{ERROR_TYPE_PREFIX}/{}", self.as_ref()),
             detail,
@@ -122,6 +140,9 @@ impl ResponseError for Error {
             Error::InvalidRequestPath { .. } | Error::PluginNotFound { .. } => {
                 HttpResponse::NotFound()
             }
+            Error::PluginInternalError { source } if plugin_internal_error_is_not_found(source) => {
+                HttpResponse::NotFound()
+            }
             Error::PayloadTooLarge => HttpResponse::PayloadTooLarge(),
             _ => HttpResponse::Unauthorized(),
         };
@@ -134,6 +155,7 @@ impl ResponseError for Error {
 
 #[cfg(test)]
 mod tests {
+    use anyhow::anyhow;
     use rstest::rstest;
 
     use super::Error;
@@ -150,6 +172,27 @@ mod tests {
     fn payload_too_large_returns_413() {
         let err = Error::PayloadTooLarge;
         let resp = actix_web::ResponseError::error_response(&err);
-        assert_eq!(resp.status(), actix_web::http::StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            resp.status(),
+            actix_web::http::StatusCode::PAYLOAD_TOO_LARGE
+        );
+    }
+
+    #[test]
+    fn missing_resource_plugin_error_returns_404() {
+        let err = Error::PluginInternalError {
+            source: anyhow!("resource not found: default/test-owner/seed-encrypted"),
+        };
+        let resp = actix_web::ResponseError::error_response(&err);
+        assert_eq!(resp.status(), actix_web::http::StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn generic_plugin_error_stays_401() {
+        let err = Error::PluginInternalError {
+            source: anyhow!("database offline"),
+        };
+        let resp = actix_web::ResponseError::error_response(&err);
+        assert_eq!(resp.status(), actix_web::http::StatusCode::UNAUTHORIZED);
     }
 }
