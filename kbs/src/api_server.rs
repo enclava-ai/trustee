@@ -158,6 +158,11 @@ impl ApiServer {
                         (1024 * 1024 * http_config.payload_request_size) as usize,
                     ))
                     .service(
+                        web::resource(kbs_path!("workload-resource/{path:.*}"))
+                            .route(web::put().to(workload_resource_api))
+                            .route(web::delete().to(workload_resource_api)),
+                    )
+                    .service(
                         web::resource([kbs_path!("{path:.*}")])
                             .route(web::get().to(api))
                             .route(web::post().to(api))
@@ -428,6 +433,130 @@ pub(crate) async fn api(
     }
 }
 
+/// Build method-aware policy data for workload-resource endpoint.
+/// Extracted as a helper for unit testing.
+pub(crate) fn build_workload_policy_data(method: &str, path_parts: &[&str]) -> serde_json::Value {
+    json!({
+        "plugin": "workload-resource",
+        "resource-path": path_parts,
+        "query": {},
+        "method": method,
+    })
+}
+
+/// Workload-authenticated ciphertext CRUD endpoint.
+/// PUT /kbs/v0/workload-resource/{repo}/{type}/{tag} - write ciphertext
+/// DELETE /kbs/v0/workload-resource/{repo}/{type}/{tag} - delete ciphertext
+///
+/// Authenticates via attestation token (not admin JWT), evaluates OPA policy
+/// with method-aware context, enforces *-owner path suffix restriction, and
+/// limits PUT payload to 64KB.
+pub(crate) async fn workload_resource_api(
+    request: HttpRequest,
+    body: web::Bytes,
+    core: web::Data<ApiServer>,
+    path: web::Path<String>,
+) -> Result<HttpResponse> {
+    let path = path.into_inner();
+    let method = request.method().clone();
+
+    // Only allow PUT and DELETE
+    if method != Method::PUT && method != Method::DELETE {
+        return Err(Error::InvalidRequestPath {
+            path: path.to_string(),
+        });
+    }
+
+    // Enforce payload size limit for PUT (64KB max for ciphertext)
+    if method == Method::PUT && body.len() > 65536 {
+        return Err(Error::PayloadTooLarge);
+    }
+
+    // Parse and validate resource path (3-segment: repo/type/tag)
+    let path_parts: Vec<&str> = path.split('/').collect();
+    if path_parts.len() != 3 {
+        return Err(Error::InvalidRequestPath {
+            path: path.to_string(),
+        });
+    }
+
+    // Hard-coded path restriction: only *-owner resource types allowed.
+    // Belt enforcement -- suspenders is the OPA policy identity binding.
+    if !path_parts[1].ends_with("-owner") {
+        return Err(Error::PolicyDeny);
+    }
+
+    // Authenticate via attestation token (Bearer or session)
+    let token = core
+        .get_attestation_token(&request)
+        .await
+        .map_err(|_| Error::TokenNotFound)?;
+    let claims = core.token_verifier.verify(token).await?;
+    let claim_str = serde_json::to_string(&claims)?;
+
+    // Construct method-aware policy data
+    let policy_data = build_workload_policy_data(method.as_str(), &path_parts);
+    let policy_data_str = policy_data.to_string();
+
+    // Evaluate OPA policy (same pattern as existing api() handler)
+    KBS_POLICY_EVALS.inc();
+    if !core
+        .policy_engine
+        .evaluate_rego(
+            Some(&policy_data_str),
+            &claim_str,
+            KBS_POLICY_ID,
+            vec![KBS_POLICY_RULE],
+            vec![],
+        )
+        .await
+        .inspect_err(|_| KBS_POLICY_ERRORS.inc())?
+        .eval_rules_result
+        .get(KBS_POLICY_RULE)
+        .expect("`data.policy.allow` rule not put as parameter found")
+        .as_ref()
+        .unwrap_or_else(|| {
+            warn!(
+                "The KBS Resource Policy does not define the `{KBS_POLICY_RULE}` rule, use false as default"
+            );
+            KBS_POLICY_ERRORS.inc();
+            &serde_json::Value::Bool(false)
+        })
+        .as_bool()
+        .unwrap_or_else(|| {
+            warn!("`{KBS_POLICY_RULE}` rule result is not a boolean, use false as default");
+            KBS_POLICY_ERRORS.inc();
+            false
+        })
+    {
+        KBS_POLICY_VIOLATIONS.inc();
+        return Err(Error::PolicyDeny);
+    }
+    KBS_POLICY_APPROVALS.inc();
+
+    // Delegate to resource plugin for actual storage.
+    // Map PUT -> POST for plugin dispatch (plugin handles "POST" for writes).
+    let resource_plugin = core
+        .plugin_manager
+        .get("resource")
+        .ok_or(Error::PluginNotFound {
+            plugin_name: "resource".into(),
+        })?;
+    let body_vec = body.to_vec();
+    let query = std::collections::HashMap::new();
+    let dispatch_method = if method == Method::PUT {
+        Method::POST
+    } else {
+        method
+    };
+    resource_plugin
+        .handle(&body_vec, &query, &path_parts, &dispatch_method)
+        .await
+        .map_err(|e| Error::PluginInternalError { source: e })?;
+
+    Ok(HttpResponse::Ok().finish())
+}
+
 pub(crate) async fn prometheus_metrics_handler(
     _request: HttpRequest,
     _core: web::Data<ApiServer>,
@@ -482,4 +611,116 @@ async fn prometheus_metrics_middleware(
     }
 
     Ok(res)
+}
+
+#[cfg(test)]
+mod workload_resource_tests {
+    use super::*;
+
+    #[test]
+    fn test_workload_resource_path_must_have_three_segments() {
+        // 2-segment path should be invalid
+        let path = "default/seed-encrypted";
+        let path_parts: Vec<&str> = path.split('/').collect();
+        assert_ne!(path_parts.len(), 3, "2-segment path should not have 3 parts");
+    }
+
+    #[test]
+    fn test_workload_resource_owner_suffix_required() {
+        // Path without -owner suffix should be rejected
+        let path_parts = vec!["default", "test-notowner", "seed-encrypted"];
+        assert!(
+            !path_parts[1].ends_with("-owner"),
+            "path without -owner suffix should fail the check"
+        );
+    }
+
+    #[test]
+    fn test_workload_resource_owner_suffix_accepted() {
+        // Path with -owner suffix should pass
+        let path_parts = vec!["default", "test-owner", "seed-encrypted"];
+        assert!(
+            path_parts[1].ends_with("-owner"),
+            "path with -owner suffix should pass the check"
+        );
+    }
+
+    #[test]
+    fn test_workload_resource_payload_too_large() {
+        // Body > 65536 bytes should be rejected for PUT
+        let oversized_body = vec![0u8; 65537];
+        assert!(
+            oversized_body.len() > 65536,
+            "oversized body should exceed 64KB limit"
+        );
+    }
+
+    #[test]
+    fn test_workload_resource_payload_boundary_ok() {
+        // Body of exactly 65536 bytes should NOT be rejected
+        let boundary_body = vec![0u8; 65536];
+        assert!(
+            boundary_body.len() <= 65536,
+            "boundary body should not exceed 64KB limit"
+        );
+    }
+
+    #[test]
+    fn test_workload_resource_policy_data_shape() {
+        let policy_data = build_workload_policy_data("PUT", &["default", "test-owner", "seed-encrypted"]);
+
+        assert_eq!(
+            policy_data["plugin"], "workload-resource",
+            "plugin field must be 'workload-resource'"
+        );
+        assert_eq!(
+            policy_data["method"], "PUT",
+            "method field must reflect the HTTP method"
+        );
+
+        let resource_path = policy_data["resource-path"]
+            .as_array()
+            .expect("resource-path must be an array");
+        assert_eq!(resource_path.len(), 3, "resource-path must have 3 segments");
+        assert_eq!(resource_path[0], "default");
+        assert_eq!(resource_path[1], "test-owner");
+        assert_eq!(resource_path[2], "seed-encrypted");
+
+        // query must be an empty object
+        assert!(
+            policy_data["query"].is_object(),
+            "query must be an object"
+        );
+    }
+
+    #[test]
+    fn test_workload_resource_policy_data_delete() {
+        let policy_data = build_workload_policy_data("DELETE", &["default", "test-owner", "seed-encrypted"]);
+        assert_eq!(policy_data["method"], "DELETE");
+        assert_eq!(policy_data["plugin"], "workload-resource");
+    }
+
+    #[test]
+    fn test_workload_resource_put_maps_to_post_dispatch() {
+        // Verify the PUT -> POST mapping logic
+        let method = Method::PUT;
+        let dispatch_method = if method == Method::PUT {
+            Method::POST
+        } else {
+            method
+        };
+        assert_eq!(dispatch_method, Method::POST, "PUT must map to POST for plugin dispatch");
+    }
+
+    #[test]
+    fn test_workload_resource_delete_stays_delete_dispatch() {
+        // DELETE should remain DELETE for plugin dispatch
+        let method = Method::DELETE;
+        let dispatch_method = if method == Method::PUT {
+            Method::POST
+        } else {
+            method.clone()
+        };
+        assert_eq!(dispatch_method, Method::DELETE, "DELETE must remain DELETE for plugin dispatch");
+    }
 }

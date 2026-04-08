@@ -61,6 +61,9 @@ pub enum Error {
         source: anyhow::Error,
     },
 
+    #[error("Payload too large")]
+    PayloadTooLarge,
+
     #[error("Access denied by policy")]
     PolicyDeny,
 
@@ -119,6 +122,7 @@ impl ResponseError for Error {
             Error::InvalidRequestPath { .. } | Error::PluginNotFound { .. } => {
                 HttpResponse::NotFound()
             }
+            Error::PayloadTooLarge => HttpResponse::PayloadTooLarge(),
             _ => HttpResponse::Unauthorized(),
         };
 
@@ -137,7 +141,15 @@ mod tests {
     #[rstest]
     #[case(Error::InvalidRequestPath{path: "test".into()})]
     #[case(Error::PluginNotFound{plugin_name: "test".into()})]
+    #[case(Error::PayloadTooLarge)]
     fn into_error_response(#[case] err: Error) {
         let _ = actix_web::ResponseError::error_response(&err);
+    }
+
+    #[test]
+    fn payload_too_large_returns_413() {
+        let err = Error::PayloadTooLarge;
+        let resp = actix_web::ResponseError::error_response(&err);
+        assert_eq!(resp.status(), actix_web::http::StatusCode::PAYLOAD_TOO_LARGE);
     }
 }
