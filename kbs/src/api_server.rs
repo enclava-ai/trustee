@@ -48,6 +48,41 @@ const OT1_OWNER_RESOURCE_SERVICE_ACCOUNT: &str = "flowforge-workload";
 const OT1_OWNER_RESOURCE_INSTANCE: &str = "ot-1";
 const OT1_OWNER_RESOURCE_IMAGE: &str =
     "ghcr.io/enclava-ai/mini-enclava@sha256:12f2542df53c4886a653136eca90865beeb9eb36f0076b5d407d2f4f1bcf5561";
+const OT2_OWNER_RESOURCE_REPO: &str = "default";
+const OT2_OWNER_RESOURCE_TYPE: &str = "flowforge-1-ot-2-owner";
+const OT2_OWNER_RESOURCE_NAMESPACE: &str = "flowforge-1";
+const OT2_OWNER_RESOURCE_SERVICE_ACCOUNT: &str = "flowforge-workload";
+const OT2_OWNER_RESOURCE_INSTANCE: &str = "ot-2";
+const OT2_OWNER_RESOURCE_IMAGE: &str =
+    "ghcr.io/enclava-ai/mini-enclava@sha256:12f2542df53c4886a653136eca90865beeb9eb36f0076b5d407d2f4f1bcf5561";
+
+struct OwnerSeedBypassRule {
+    repo: &'static str,
+    resource_type: &'static str,
+    namespace: &'static str,
+    service_account: &'static str,
+    instance: &'static str,
+    image: &'static str,
+}
+
+const OWNER_SEED_BYPASS_RULES: &[OwnerSeedBypassRule] = &[
+    OwnerSeedBypassRule {
+        repo: OT1_OWNER_RESOURCE_REPO,
+        resource_type: OT1_OWNER_RESOURCE_TYPE,
+        namespace: OT1_OWNER_RESOURCE_NAMESPACE,
+        service_account: OT1_OWNER_RESOURCE_SERVICE_ACCOUNT,
+        instance: OT1_OWNER_RESOURCE_INSTANCE,
+        image: OT1_OWNER_RESOURCE_IMAGE,
+    },
+    OwnerSeedBypassRule {
+        repo: OT2_OWNER_RESOURCE_REPO,
+        resource_type: OT2_OWNER_RESOURCE_TYPE,
+        namespace: OT2_OWNER_RESOURCE_NAMESPACE,
+        service_account: OT2_OWNER_RESOURCE_SERVICE_ACCOUNT,
+        instance: OT2_OWNER_RESOURCE_INSTANCE,
+        image: OT2_OWNER_RESOURCE_IMAGE,
+    },
+];
 
 macro_rules! kbs_path {
     ($path:expr) => {
@@ -55,25 +90,45 @@ macro_rules! kbs_path {
     };
 }
 
-fn is_exact_ot1_owner_seed_path(path_parts: &[&str]) -> bool {
+fn is_exact_owner_seed_path_for_rule(path_parts: &[&str], rule: &OwnerSeedBypassRule) -> bool {
     matches!(path_parts, [repo, resource_type, "seed-encrypted"]
-        if *repo == OT1_OWNER_RESOURCE_REPO && *resource_type == OT1_OWNER_RESOURCE_TYPE)
+        if *repo == rule.repo && *resource_type == rule.resource_type)
         || matches!(path_parts, [repo, resource_type, "seed-sealed"]
-            if *repo == OT1_OWNER_RESOURCE_REPO && *resource_type == OT1_OWNER_RESOURCE_TYPE)
+            if *repo == rule.repo && *resource_type == rule.resource_type)
 }
 
-fn claims_match_ot1_owner_seed_workload(claim_str: &str) -> bool {
+#[cfg(test)]
+fn is_exact_owner_seed_path(path_parts: &[&str]) -> bool {
+    OWNER_SEED_BYPASS_RULES
+        .iter()
+        .any(|rule| is_exact_owner_seed_path_for_rule(path_parts, rule))
+}
+
+fn claims_match_owner_seed_workload_for_rule(claim_str: &str, rule: &OwnerSeedBypassRule) -> bool {
     claim_str.contains(&format!(
-        "\"io.kubernetes.pod.namespace\":\"{OT1_OWNER_RESOURCE_NAMESPACE}\""
+        "\"io.kubernetes.pod.namespace\":\"{}\"",
+        rule.namespace
     )) && claim_str.contains(&format!(
-        "\"io.kubernetes.pod.service-account.name\":\"{OT1_OWNER_RESOURCE_SERVICE_ACCOUNT}\""
+        "\"io.kubernetes.pod.service-account.name\":\"{}\"",
+        rule.service_account
     )) && claim_str.contains(&format!(
-        "\"tenant.flowforge.sh/instance\":\"{OT1_OWNER_RESOURCE_INSTANCE}\""
-    )) && claim_str.contains(OT1_OWNER_RESOURCE_IMAGE)
+        "\"tenant.flowforge.sh/instance\":\"{}\"",
+        rule.instance
+    )) && claim_str.contains(rule.image)
+}
+
+#[cfg(test)]
+fn claims_match_owner_seed_workload(claim_str: &str) -> bool {
+    OWNER_SEED_BYPASS_RULES
+        .iter()
+        .any(|rule| claims_match_owner_seed_workload_for_rule(claim_str, rule))
 }
 
 fn should_bypass_owner_seed_policy(path_parts: &[&str], claim_str: &str) -> bool {
-    is_exact_ot1_owner_seed_path(path_parts) && claims_match_ot1_owner_seed_workload(claim_str)
+    OWNER_SEED_BYPASS_RULES.iter().any(|rule| {
+        is_exact_owner_seed_path_for_rule(path_parts, rule)
+            && claims_match_owner_seed_workload_for_rule(claim_str, rule)
+    })
 }
 
 /// The KBS API server
@@ -788,30 +843,45 @@ mod workload_resource_tests {
 
     #[test]
     fn test_owner_seed_policy_bypass_path_matching() {
-        assert!(is_exact_ot1_owner_seed_path(&[
+        assert!(is_exact_owner_seed_path(&[
             "default",
             "flowforge-1-ot-1-owner",
             "seed-encrypted",
         ]));
-        assert!(is_exact_ot1_owner_seed_path(&[
+        assert!(is_exact_owner_seed_path(&[
             "default",
             "flowforge-1-ot-1-owner",
             "seed-sealed",
         ]));
-        assert!(!is_exact_ot1_owner_seed_path(&[
+        assert!(is_exact_owner_seed_path(&[
             "default",
             "flowforge-1-ot-2-owner",
             "seed-encrypted",
+        ]));
+        assert!(!is_exact_owner_seed_path(&[
+            "default",
+            "flowforge-1-ot-3-owner",
+            "seed-encrypted",
+        ]));
+        assert!(!is_exact_owner_seed_path(&[
+            "default",
+            "flowforge-1-ot-2-owner",
+            "seed-encrypted",
+            "extra",
         ]));
     }
 
     #[test]
     fn test_owner_seed_policy_bypass_claim_matching() {
         let claims = r#"{"submods":{"cpu0":{"ear.veraison.annotated-evidence":{"init_data_claims":{"agent_policy_claims":{"containers":[{"OCI":{"Annotations":{"io.kubernetes.pod.namespace":"flowforge-1","io.kubernetes.pod.service-account.name":"flowforge-workload","tenant.flowforge.sh/instance":"ot-1"}},"image_name":"ghcr.io/enclava-ai/mini-enclava@sha256:12f2542df53c4886a653136eca90865beeb9eb36f0076b5d407d2f4f1bcf5561"}]}}}}}"#;
-        assert!(claims_match_ot1_owner_seed_workload(claims));
-        assert!(!claims_match_ot1_owner_seed_workload(&claims.replace(
+        assert!(claims_match_owner_seed_workload(claims));
+        assert!(claims_match_owner_seed_workload(&claims.replace(
             "\"tenant.flowforge.sh/instance\":\"ot-1\"",
             "\"tenant.flowforge.sh/instance\":\"ot-2\""
+        )));
+        assert!(!claims_match_owner_seed_workload(&claims.replace(
+            "\"tenant.flowforge.sh/instance\":\"ot-1\"",
+            "\"tenant.flowforge.sh/instance\":\"ot-3\""
         )));
     }
 }
