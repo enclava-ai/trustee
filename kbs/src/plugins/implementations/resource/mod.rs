@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 pub mod kv_storage;
+pub mod local_fs;
 
 #[cfg(feature = "aliyun")]
 pub mod aliyun_kms;

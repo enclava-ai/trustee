@@ -11,7 +11,7 @@ use serde::Deserialize;
 use std::fmt;
 
 use crate::{
-    plugins::resource::kv_storage,
+    plugins::resource::{kv_storage, local_fs},
     prometheus::{RESOURCE_DELETES_TOTAL, RESOURCE_READS_TOTAL, RESOURCE_WRITES_TOTAL},
 };
 
@@ -76,12 +76,14 @@ impl fmt::Display for ResourceDesc {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Default)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(tag = "type")]
 pub enum RepositoryConfig {
     #[serde(alias = "kvstorage")]
-    #[default]
     KvStorage,
+
+    #[serde(alias = "localfs")]
+    LocalFs { dir_path: String },
 
     #[cfg(feature = "aliyun")]
     #[serde(alias = "aliyun")]
@@ -90,6 +92,12 @@ pub enum RepositoryConfig {
     #[cfg(feature = "vault")]
     #[serde(alias = "vault")]
     Vault(vault_kv::VaultKvBackendConfig),
+}
+
+impl Default for RepositoryConfig {
+    fn default() -> Self {
+        Self::KvStorage
+    }
 }
 
 #[derive(Clone)]
@@ -112,6 +120,12 @@ impl ResourceStorage {
                     )
                     .await?;
                 let backend = kv_storage::KvStorage::new(storage);
+                Ok(Self {
+                    backend: Arc::new(backend),
+                })
+            }
+            RepositoryConfig::LocalFs { dir_path } => {
+                let backend = local_fs::LocalFs::new(local_fs::LocalFsConfig { dir_path });
                 Ok(Self {
                     backend: Arc::new(backend),
                 })

@@ -204,6 +204,44 @@ mod tests {
         }),
         PluginsConfig::ResourceStorage(RepositoryConfig::KvStorage)],
     })]
+    #[case("test_data/configs/coco-as-grpc-local-fs.toml",         KbsConfig {
+        attestation_token: AttestationTokenVerifierConfig {
+            trusted_certs_paths: vec![],
+            insecure_key: true,
+            trusted_jwk_sets: vec![],
+            extra_teekey_paths: vec![],
+        },
+        #[cfg(feature = "coco-as-grpc")]
+        attestation_service: crate::attestation::config::AttestationConfig {
+            attestation_service:
+                crate::attestation::config::AttestationServiceConfig::CoCoASGrpc(
+                    crate::attestation::coco::grpc::GrpcConfig {
+                        as_addr: "http://127.0.0.1:50004".into(),
+                        pool_size: crate::attestation::coco::grpc::DEFAULT_POOL_SIZE,
+                    },
+                ),
+            timeout: crate::attestation::config::DEFAULT_TIMEOUT,
+        },
+        http_server: HttpServerConfig {
+            sockets: vec!["0.0.0.0:8080".parse().unwrap()],
+            private_key: None,
+            certificate: None,
+            insecure_http: true,
+            payload_request_size: DEFAULT_PAYLOAD_REQUEST_SIZE,
+            worker_count: Some(4),
+        },
+        admin: AdminConfig {
+            admin_backend: AdminBackendType::DenyAll,
+            roles: Vec::new(),
+        },
+        policy_engine: PolicyEngineConfig {
+            policy_path: Some("/opt/confidential-containers/opa/policy.rego".into()),
+        },
+        storage_backend: StorageBackendConfig::default(),
+        plugins: vec![PluginsConfig::ResourceStorage(RepositoryConfig::LocalFs {
+            dir_path: "/opt/confidential-containers/kbs/repository".into(),
+        })],
+    })]
     #[case("test_data/configs/coco-as-builtin-1.toml",         KbsConfig {
         attestation_token: AttestationTokenVerifierConfig {
             trusted_certs_paths: vec![],
