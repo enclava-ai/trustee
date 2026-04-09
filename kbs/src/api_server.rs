@@ -41,94 +41,10 @@ pub const KBS_POLICY_RULE: &str = "data.policy.allow";
 /// The name of the policy identifier for the KBS Resource Policy
 pub const KBS_POLICY_ID: &str = "resource-policy";
 
-const OT1_OWNER_RESOURCE_REPO: &str = "default";
-const OT1_OWNER_RESOURCE_TYPE: &str = "flowforge-1-ot-1-owner";
-const OT1_OWNER_RESOURCE_NAMESPACE: &str = "flowforge-1";
-const OT1_OWNER_RESOURCE_SERVICE_ACCOUNT: &str = "flowforge-workload";
-const OT1_OWNER_RESOURCE_INSTANCE: &str = "ot-1";
-const OT1_OWNER_RESOURCE_IMAGE: &str =
-    "ghcr.io/enclava-ai/mini-enclava@sha256:12f2542df53c4886a653136eca90865beeb9eb36f0076b5d407d2f4f1bcf5561";
-const OT2_OWNER_RESOURCE_REPO: &str = "default";
-const OT2_OWNER_RESOURCE_TYPE: &str = "flowforge-1-ot-2-owner";
-const OT2_OWNER_RESOURCE_NAMESPACE: &str = "flowforge-1";
-const OT2_OWNER_RESOURCE_SERVICE_ACCOUNT: &str = "flowforge-workload";
-const OT2_OWNER_RESOURCE_INSTANCE: &str = "ot-2";
-const OT2_OWNER_RESOURCE_IMAGE: &str =
-    "ghcr.io/enclava-ai/mini-enclava@sha256:12f2542df53c4886a653136eca90865beeb9eb36f0076b5d407d2f4f1bcf5561";
-
-struct OwnerSeedBypassRule {
-    repo: &'static str,
-    resource_type: &'static str,
-    namespace: &'static str,
-    service_account: &'static str,
-    instance: &'static str,
-    image: &'static str,
-}
-
-const OWNER_SEED_BYPASS_RULES: &[OwnerSeedBypassRule] = &[
-    OwnerSeedBypassRule {
-        repo: OT1_OWNER_RESOURCE_REPO,
-        resource_type: OT1_OWNER_RESOURCE_TYPE,
-        namespace: OT1_OWNER_RESOURCE_NAMESPACE,
-        service_account: OT1_OWNER_RESOURCE_SERVICE_ACCOUNT,
-        instance: OT1_OWNER_RESOURCE_INSTANCE,
-        image: OT1_OWNER_RESOURCE_IMAGE,
-    },
-    OwnerSeedBypassRule {
-        repo: OT2_OWNER_RESOURCE_REPO,
-        resource_type: OT2_OWNER_RESOURCE_TYPE,
-        namespace: OT2_OWNER_RESOURCE_NAMESPACE,
-        service_account: OT2_OWNER_RESOURCE_SERVICE_ACCOUNT,
-        instance: OT2_OWNER_RESOURCE_INSTANCE,
-        image: OT2_OWNER_RESOURCE_IMAGE,
-    },
-];
-
 macro_rules! kbs_path {
     ($path:expr) => {
         format!("{}/{}", KBS_PREFIX, $path)
     };
-}
-
-fn is_exact_owner_seed_path_for_rule(path_parts: &[&str], rule: &OwnerSeedBypassRule) -> bool {
-    matches!(path_parts, [repo, resource_type, "seed-encrypted"]
-        if *repo == rule.repo && *resource_type == rule.resource_type)
-        || matches!(path_parts, [repo, resource_type, "seed-sealed"]
-            if *repo == rule.repo && *resource_type == rule.resource_type)
-}
-
-#[cfg(test)]
-fn is_exact_owner_seed_path(path_parts: &[&str]) -> bool {
-    OWNER_SEED_BYPASS_RULES
-        .iter()
-        .any(|rule| is_exact_owner_seed_path_for_rule(path_parts, rule))
-}
-
-fn claims_match_owner_seed_workload_for_rule(claim_str: &str, rule: &OwnerSeedBypassRule) -> bool {
-    claim_str.contains(&format!(
-        "\"io.kubernetes.pod.namespace\":\"{}\"",
-        rule.namespace
-    )) && claim_str.contains(&format!(
-        "\"io.kubernetes.pod.service-account.name\":\"{}\"",
-        rule.service_account
-    )) && claim_str.contains(&format!(
-        "\"tenant.flowforge.sh/instance\":\"{}\"",
-        rule.instance
-    )) && claim_str.contains(rule.image)
-}
-
-#[cfg(test)]
-fn claims_match_owner_seed_workload(claim_str: &str) -> bool {
-    OWNER_SEED_BYPASS_RULES
-        .iter()
-        .any(|rule| claims_match_owner_seed_workload_for_rule(claim_str, rule))
-}
-
-fn should_bypass_owner_seed_policy(path_parts: &[&str], claim_str: &str) -> bool {
-    OWNER_SEED_BYPASS_RULES.iter().any(|rule| {
-        is_exact_owner_seed_path_for_rule(path_parts, rule)
-            && claims_match_owner_seed_workload_for_rule(claim_str, rule)
-    })
 }
 
 /// The KBS API server
@@ -469,41 +385,39 @@ pub(crate) async fn api(
 
                 let claim_str = serde_json::to_string(&claims)?;
 
-                if !should_bypass_owner_seed_policy(resource_path, &claim_str) {
-                    KBS_POLICY_EVALS.inc();
-                    // TODO: add policy filter support for other plugins
-                    if !core
-                        .policy_engine
-                        .evaluate_rego(
-                            Some(&policy_data_str),
-                            &claim_str,
-                            KBS_POLICY_ID,
-                            vec![KBS_POLICY_RULE],
-                            vec![],
-                        )
-                        .await
-                        .inspect_err(|_| KBS_POLICY_ERRORS.inc())?
-                        .eval_rules_result
-                        .get(KBS_POLICY_RULE)
-                        .expect("`data.policy.allow` rule not put as parameter found")
-                        .as_ref()
-                        .unwrap_or_else(|| {
-                            warn!("The KBS Resource Policy does not define the `{KBS_POLICY_RULE}` rule, use false as default" );
-                            KBS_POLICY_ERRORS.inc();
-                            &serde_json::Value::Bool(false)
-                        })
-                        .as_bool()
-                        .unwrap_or_else(|| {
-                            warn!("`{KBS_POLICY_RULE}` rule result is not a boolean, use false as default");
-                            KBS_POLICY_ERRORS.inc();
-                            false
-                        })
-                    {
-                        KBS_POLICY_VIOLATIONS.inc();
-                        return Err(Error::PolicyDeny);
-                    }
-                    KBS_POLICY_APPROVALS.inc();
+                KBS_POLICY_EVALS.inc();
+                // TODO: add policy filter support for other plugins
+                if !core
+                    .policy_engine
+                    .evaluate_rego(
+                        Some(&policy_data_str),
+                        &claim_str,
+                        KBS_POLICY_ID,
+                        vec![KBS_POLICY_RULE],
+                        vec![],
+                    )
+                    .await
+                    .inspect_err(|_| KBS_POLICY_ERRORS.inc())?
+                    .eval_rules_result
+                    .get(KBS_POLICY_RULE)
+                    .expect("`data.policy.allow` rule not put as parameter found")
+                    .as_ref()
+                    .unwrap_or_else(|| {
+                        warn!("The KBS Resource Policy does not define the `{KBS_POLICY_RULE}` rule, use false as default" );
+                        KBS_POLICY_ERRORS.inc();
+                        &serde_json::Value::Bool(false)
+                    })
+                    .as_bool()
+                    .unwrap_or_else(|| {
+                        warn!("`{KBS_POLICY_RULE}` rule result is not a boolean, use false as default");
+                        KBS_POLICY_ERRORS.inc();
+                        false
+                    })
+                {
+                    KBS_POLICY_VIOLATIONS.inc();
+                    return Err(Error::PolicyDeny);
                 }
+                KBS_POLICY_APPROVALS.inc();
 
                 let response = plugin
                     .handle(&body, &query, resource_path, request.method())
@@ -595,50 +509,48 @@ pub(crate) async fn workload_resource_api(
     let policy_data_str = policy_data.to_string();
 
     // Evaluate OPA policy (same pattern as existing api() handler)
-    if !should_bypass_owner_seed_policy(&path_parts, &claim_str) {
-        KBS_POLICY_EVALS.inc();
-        let policy_result = core
-            .policy_engine
-            .evaluate_rego(
-                Some(&policy_data_str),
-                &claim_str,
-                KBS_POLICY_ID,
-                vec![KBS_POLICY_RULE],
-                vec![],
-            )
-            .await
-            .inspect_err(|_| KBS_POLICY_ERRORS.inc())?;
-        let allowed = policy_result
-            .eval_rules_result
-            .get(KBS_POLICY_RULE)
-            .expect("`data.policy.allow` rule not put as parameter found")
-            .as_ref()
-            .unwrap_or_else(|| {
-                warn!(
-                    "The KBS Resource Policy does not define the `{KBS_POLICY_RULE}` rule, use false as default"
-                );
-                KBS_POLICY_ERRORS.inc();
-                &serde_json::Value::Bool(false)
-            })
-            .as_bool()
-            .unwrap_or_else(|| {
-                warn!("`{KBS_POLICY_RULE}` rule result is not a boolean, use false as default");
-                KBS_POLICY_ERRORS.inc();
-                false
-            });
-        if !allowed {
+    KBS_POLICY_EVALS.inc();
+    let policy_result = core
+        .policy_engine
+        .evaluate_rego(
+            Some(&policy_data_str),
+            &claim_str,
+            KBS_POLICY_ID,
+            vec![KBS_POLICY_RULE],
+            vec![],
+        )
+        .await
+        .inspect_err(|_| KBS_POLICY_ERRORS.inc())?;
+    let allowed = policy_result
+        .eval_rules_result
+        .get(KBS_POLICY_RULE)
+        .expect("`data.policy.allow` rule not put as parameter found")
+        .as_ref()
+        .unwrap_or_else(|| {
             warn!(
-                method = %method,
-                path = %path,
-                policy_data = %policy_data_str,
-                claims = %claim_str,
-                "workload_resource_api denied by policy"
+                "The KBS Resource Policy does not define the `{KBS_POLICY_RULE}` rule, use false as default"
             );
-            KBS_POLICY_VIOLATIONS.inc();
-            return Err(Error::PolicyDeny);
-        }
-        KBS_POLICY_APPROVALS.inc();
+            KBS_POLICY_ERRORS.inc();
+            &serde_json::Value::Bool(false)
+        })
+        .as_bool()
+        .unwrap_or_else(|| {
+            warn!("`{KBS_POLICY_RULE}` rule result is not a boolean, use false as default");
+            KBS_POLICY_ERRORS.inc();
+            false
+        });
+    if !allowed {
+        warn!(
+            method = %method,
+            path = %path,
+            policy_data = %policy_data_str,
+            claims = %claim_str,
+            "workload_resource_api denied by policy"
+        );
+        KBS_POLICY_VIOLATIONS.inc();
+        return Err(Error::PolicyDeny);
     }
+    KBS_POLICY_APPROVALS.inc();
 
     // Delegate to resource plugin for actual storage.
     // Map PUT -> POST for plugin dispatch (plugin handles "POST" for writes).
@@ -839,49 +751,5 @@ mod workload_resource_tests {
             Method::DELETE,
             "DELETE must remain DELETE for plugin dispatch"
         );
-    }
-
-    #[test]
-    fn test_owner_seed_policy_bypass_path_matching() {
-        assert!(is_exact_owner_seed_path(&[
-            "default",
-            "flowforge-1-ot-1-owner",
-            "seed-encrypted",
-        ]));
-        assert!(is_exact_owner_seed_path(&[
-            "default",
-            "flowforge-1-ot-1-owner",
-            "seed-sealed",
-        ]));
-        assert!(is_exact_owner_seed_path(&[
-            "default",
-            "flowforge-1-ot-2-owner",
-            "seed-encrypted",
-        ]));
-        assert!(!is_exact_owner_seed_path(&[
-            "default",
-            "flowforge-1-ot-3-owner",
-            "seed-encrypted",
-        ]));
-        assert!(!is_exact_owner_seed_path(&[
-            "default",
-            "flowforge-1-ot-2-owner",
-            "seed-encrypted",
-            "extra",
-        ]));
-    }
-
-    #[test]
-    fn test_owner_seed_policy_bypass_claim_matching() {
-        let claims = r#"{"submods":{"cpu0":{"ear.veraison.annotated-evidence":{"init_data_claims":{"agent_policy_claims":{"containers":[{"OCI":{"Annotations":{"io.kubernetes.pod.namespace":"flowforge-1","io.kubernetes.pod.service-account.name":"flowforge-workload","tenant.flowforge.sh/instance":"ot-1"}},"image_name":"ghcr.io/enclava-ai/mini-enclava@sha256:12f2542df53c4886a653136eca90865beeb9eb36f0076b5d407d2f4f1bcf5561"}]}}}}}"#;
-        assert!(claims_match_owner_seed_workload(claims));
-        assert!(claims_match_owner_seed_workload(&claims.replace(
-            "\"tenant.flowforge.sh/instance\":\"ot-1\"",
-            "\"tenant.flowforge.sh/instance\":\"ot-2\""
-        )));
-        assert!(!claims_match_owner_seed_workload(&claims.replace(
-            "\"tenant.flowforge.sh/instance\":\"ot-1\"",
-            "\"tenant.flowforge.sh/instance\":\"ot-3\""
-        )));
     }
 }
