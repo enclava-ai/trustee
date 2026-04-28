@@ -59,6 +59,16 @@ impl Default for HttpServerConfig {
 pub struct PolicyEngineConfig {
     /// Path to a Rego policy file to load at startup.
     pub policy_path: Option<PathBuf>,
+
+    /// Require resource policies to be stored as signed policy artifacts.
+    ///
+    /// This defaults to false for compatibility with existing Trustee
+    /// deployments that store raw Rego policies.
+    pub require_signed_policy: bool,
+
+    /// Hex or base64 encoded Ed25519 public key used to verify signed policy
+    /// artifacts when `require_signed_policy` is true.
+    pub signed_policy_public_key: Option<String>,
 }
 
 /// Contains all configurable KBS properties.
@@ -188,6 +198,8 @@ mod tests {
         },
         policy_engine: PolicyEngineConfig {
             policy_path: Some("/opt/confidential-containers/opa/policy.rego".into()),
+            require_signed_policy: false,
+            signed_policy_public_key: None,
         },
         storage_backend: StorageBackendConfig {
             storage_type: KeyValueStorageType::LocalJson,
@@ -236,6 +248,8 @@ mod tests {
         },
         policy_engine: PolicyEngineConfig {
             policy_path: Some("/opt/confidential-containers/opa/policy.rego".into()),
+            require_signed_policy: false,
+            signed_policy_public_key: None,
         },
         storage_backend: StorageBackendConfig::default(),
         plugins: vec![PluginsConfig::ResourceStorage(RepositoryConfig::LocalFs {

@@ -21,12 +21,17 @@ pub use backend::*;
 
 use super::super::plugin_manager::ClientPlugin;
 
+pub(crate) const WORKLOAD_RESOURCE_CONDITION_QUERY: &str = "__kbs_workload_resource_condition";
+pub(crate) const WORKLOAD_RESOURCE_CONDITION_CREATE: &str = "create-if-absent";
+pub(crate) const WORKLOAD_RESOURCE_CONDITION_REPLACE: &str = "replace-if-present";
+pub(crate) const WORKLOAD_RESOURCE_CONDITION_DELETE: &str = "delete-if-present";
+
 #[async_trait::async_trait]
 impl ClientPlugin for ResourceStorage {
     async fn handle(
         &self,
         body: &[u8],
-        _query: &HashMap<String, String>,
+        query: &HashMap<String, String>,
         path: &[&str],
         method: &Method,
     ) -> Result<Vec<u8>> {
@@ -34,7 +39,29 @@ impl ClientPlugin for ResourceStorage {
         match method.as_str() {
             "POST" => {
                 let resource_description = ResourceDesc::try_from(&resource_desc[..])?;
-                self.set_secret_resource(resource_description, body).await?;
+                match query
+                    .get(WORKLOAD_RESOURCE_CONDITION_QUERY)
+                    .map(String::as_str)
+                {
+                    Some(WORKLOAD_RESOURCE_CONDITION_CREATE) => {
+                        if !self
+                            .create_secret_resource(resource_description, body)
+                            .await?
+                        {
+                            bail!("resource precondition failed: resource already exists");
+                        }
+                    }
+                    Some(WORKLOAD_RESOURCE_CONDITION_REPLACE) => {
+                        if !self
+                            .replace_secret_resource(resource_description, body)
+                            .await?
+                        {
+                            bail!("resource precondition failed: resource does not exist");
+                        }
+                    }
+                    Some(other) => bail!("unsupported resource condition: {other}"),
+                    None => self.set_secret_resource(resource_description, body).await?,
+                }
                 Ok(vec![])
             }
             "GET" => {
@@ -45,7 +72,21 @@ impl ClientPlugin for ResourceStorage {
             }
             "DELETE" => {
                 let resource_description = ResourceDesc::try_from(&resource_desc[..])?;
-                self.delete_secret_resource(resource_description).await?;
+                match query
+                    .get(WORKLOAD_RESOURCE_CONDITION_QUERY)
+                    .map(String::as_str)
+                {
+                    Some(WORKLOAD_RESOURCE_CONDITION_DELETE) => {
+                        if !self
+                            .delete_existing_secret_resource(resource_description)
+                            .await?
+                        {
+                            bail!("resource precondition failed: resource does not exist");
+                        }
+                    }
+                    Some(other) => bail!("unsupported resource condition: {other}"),
+                    None => self.delete_secret_resource(resource_description).await?,
+                }
                 Ok(vec![])
             }
             _ => bail!("Illegal HTTP method. Only supports `GET`, `POST` and `DELETE`"),

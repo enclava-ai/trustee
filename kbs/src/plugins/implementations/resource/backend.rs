@@ -31,8 +31,41 @@ pub trait StorageBackend: Send + Sync {
     /// Write secret resource into repository
     async fn write_secret_resource(&self, resource_desc: ResourceDesc, data: &[u8]) -> Result<()>;
 
+    /// Create a secret resource only when it is absent.
+    ///
+    /// Implementations should override this with a storage-level insert-if-absent
+    /// primitive when available. The default is fail-closed because a generic
+    /// read-before-write fallback would reintroduce the race this API prevents.
+    async fn write_secret_resource_if_absent(
+        &self,
+        _resource_desc: ResourceDesc,
+        _data: &[u8],
+    ) -> Result<bool> {
+        bail!("conditional create is not supported by this resource backend")
+    }
+
+    /// Replace a secret resource only when it is present.
+    ///
+    /// This is an existence precondition rather than full versioned CAS; storage
+    /// backends do not currently expose per-resource versions.
+    async fn write_secret_resource_if_present(
+        &self,
+        _resource_desc: ResourceDesc,
+        _data: &[u8],
+    ) -> Result<bool> {
+        bail!("conditional replace is not supported by this resource backend")
+    }
+
     /// Delete secret resource from repository
     async fn delete_secret_resource(&self, resource_desc: ResourceDesc) -> Result<()>;
+
+    /// Delete a secret resource only when it is present.
+    async fn delete_secret_resource_if_present(
+        &self,
+        _resource_desc: ResourceDesc,
+    ) -> Result<bool> {
+        bail!("conditional delete is not supported by this resource backend")
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -162,11 +195,49 @@ impl ResourceStorage {
             .await
     }
 
+    pub(crate) async fn create_secret_resource(
+        &self,
+        resource_desc: ResourceDesc,
+        data: &[u8],
+    ) -> Result<bool> {
+        RESOURCE_WRITES_TOTAL
+            .with_label_values(&[&format!("{}", resource_desc)])
+            .inc();
+        self.backend
+            .write_secret_resource_if_absent(resource_desc, data)
+            .await
+    }
+
+    pub(crate) async fn replace_secret_resource(
+        &self,
+        resource_desc: ResourceDesc,
+        data: &[u8],
+    ) -> Result<bool> {
+        RESOURCE_WRITES_TOTAL
+            .with_label_values(&[&format!("{}", resource_desc)])
+            .inc();
+        self.backend
+            .write_secret_resource_if_present(resource_desc, data)
+            .await
+    }
+
     pub(crate) async fn delete_secret_resource(&self, resource_desc: ResourceDesc) -> Result<()> {
         RESOURCE_DELETES_TOTAL
             .with_label_values(&[&format!("{}", resource_desc)])
             .inc();
         self.backend.delete_secret_resource(resource_desc).await
+    }
+
+    pub(crate) async fn delete_existing_secret_resource(
+        &self,
+        resource_desc: ResourceDesc,
+    ) -> Result<bool> {
+        RESOURCE_DELETES_TOTAL
+            .with_label_values(&[&format!("{}", resource_desc)])
+            .inc();
+        self.backend
+            .delete_secret_resource_if_present(resource_desc)
+            .await
     }
 
     pub(crate) async fn get_secret_resource(&self, resource_desc: ResourceDesc) -> Result<Vec<u8>> {

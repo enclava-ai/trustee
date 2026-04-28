@@ -7,7 +7,7 @@
 use async_trait::async_trait;
 use tokio::sync::RwLock;
 
-use crate::{KeyValueStorage, Result, SetParameters, SetResult};
+use crate::{DeleteResult, KeyValueStorage, Result, SetParameters, SetResult, UpdateResult};
 use std::collections::HashMap;
 use tracing::instrument;
 
@@ -20,21 +20,26 @@ pub struct MemoryKeyValueStorage {
 impl KeyValueStorage for MemoryKeyValueStorage {
     #[instrument(skip_all, name = "MemoryKeyValueStorage::set", fields(key = key))]
     async fn set(&self, key: &str, value: &[u8], parameters: SetParameters) -> Result<SetResult> {
+        let mut items = self.items.write().await;
         if parameters.overwrite {
-            self.items
-                .write()
-                .await
-                .insert(key.to_string(), value.to_vec());
+            items.insert(key.to_string(), value.to_vec());
+        } else if items.contains_key(key) {
+            return Ok(SetResult::AlreadyExists);
         } else {
-            if self.items.read().await.contains_key(key) {
-                return Ok(SetResult::AlreadyExists);
-            }
-            self.items
-                .write()
-                .await
-                .insert(key.to_string(), value.to_vec());
+            items.insert(key.to_string(), value.to_vec());
         }
         Ok(SetResult::Inserted)
+    }
+
+    #[instrument(skip_all, name = "MemoryKeyValueStorage::update_if_present", fields(key = key))]
+    async fn update_if_present(&self, key: &str, value: &[u8]) -> Result<UpdateResult> {
+        let mut items = self.items.write().await;
+        let Some(item) = items.get_mut(key) else {
+            return Ok(UpdateResult::NotFound);
+        };
+
+        *item = value.to_vec();
+        Ok(UpdateResult::Updated)
     }
 
     #[instrument(skip_all, name = "MemoryKeyValueStorage::list")]
@@ -53,6 +58,14 @@ impl KeyValueStorage for MemoryKeyValueStorage {
     async fn delete(&self, key: &str) -> Result<Option<Vec<u8>>> {
         let res = self.items.write().await.remove(key);
         Ok(res)
+    }
+
+    #[instrument(skip_all, name = "MemoryKeyValueStorage::delete_if_present", fields(key = key))]
+    async fn delete_if_present(&self, key: &str) -> Result<DeleteResult> {
+        match self.items.write().await.remove(key) {
+            Some(value) => Ok(DeleteResult::Deleted(value)),
+            None => Ok(DeleteResult::NotFound),
+        }
     }
 }
 

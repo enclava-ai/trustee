@@ -35,10 +35,23 @@ pub enum SetResult {
     AlreadyExists,
 }
 
+pub enum UpdateResult {
+    Updated,
+    NotFound,
+}
+
+pub enum DeleteResult {
+    Deleted(Vec<u8>),
+    NotFound,
+}
+
 #[async_trait]
 pub trait KeyValueStorage: Send + Sync {
     /// Set a value for a key.
     async fn set(&self, key: &str, value: &[u8], parameters: SetParameters) -> Result<SetResult>;
+
+    /// Update a value only when the key already exists.
+    async fn update_if_present(&self, key: &str, value: &[u8]) -> Result<UpdateResult>;
 
     /// List all keys.
     async fn list(&self) -> Result<Vec<String>>;
@@ -49,6 +62,9 @@ pub trait KeyValueStorage: Send + Sync {
     /// Delete a value for a key.
     /// Return the deleted value if it exists.
     async fn delete(&self, key: &str) -> Result<Option<Vec<u8>>>;
+
+    /// Delete a value only when the key already exists.
+    async fn delete_if_present(&self, key: &str) -> Result<DeleteResult>;
 }
 
 pub type KeyValueStorageInstance = Arc<dyn KeyValueStorage>;
@@ -96,6 +112,10 @@ impl KeyValueStorageStructConfig {
                         })?;
                 Ok(Arc::new(postgres::PostgresClient::new(config.clone(), namespace).await?) as _)
             }
+            #[cfg(not(feature = "postgres"))]
+            KeyValueStorageType::Postgres => Err(KeyValueStorageError::InvalidConfiguration {
+                message: "PostgreSQL backend requires the `postgres` feature".to_string(),
+            }),
             KeyValueStorageType::LocalJson => {
                 let config =
                     self.local_json
@@ -191,6 +211,7 @@ file_dir_path = "/opt/confidential-containers/storage/local_json"
 dir_path = "/opt/confidential-containers/storage/local_fs"
         "#;
         let config: KeyValueStorageStructConfig = toml::from_str(config).unwrap();
+        #[cfg(feature = "postgres")]
         assert_eq!(config.postgres.as_ref().unwrap().db, "test");
         assert_eq!(
             config.local_json.as_ref().unwrap().file_dir_path,

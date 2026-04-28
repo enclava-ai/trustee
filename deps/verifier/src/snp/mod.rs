@@ -621,6 +621,7 @@ pub(crate) fn parse_tee_evidence(report: &AttestationReport) -> TeeEvidenceParse
         "measurement": hex::encode(report.measurement),
         "report_data": hex::encode(report.report_data),
         "init_data": hex::encode(report.host_data),
+        "init_data_hash": hex::encode(report.host_data),
     });
 
     claims_map as TeeEvidenceParsedClaim
@@ -997,6 +998,10 @@ mod tests {
         let measurement = claims.get("measurement").and_then(|v| v.as_str()).unwrap();
         let report_data = claims.get("report_data").and_then(|v| v.as_str()).unwrap();
         let init_data = claims.get("init_data").and_then(|v| v.as_str()).unwrap();
+        let init_data_hash = claims
+            .get("init_data_hash")
+            .and_then(|v| v.as_str())
+            .unwrap();
 
         // Verify they are valid hex strings by checking:
         // 1. All characters are valid hex digits (0-9, a-f)
@@ -1026,6 +1031,10 @@ mod tests {
 
         // init_data (host_data) is 32 bytes -> 64 hex chars
         assert_eq!(init_data.len(), 64, "init_data should be 64 hex characters");
+        assert_eq!(
+            init_data_hash, init_data,
+            "init_data_hash should alias SNP HOST_DATA for policy input compatibility"
+        );
         assert!(
             init_data.chars().all(|c| c.is_ascii_hexdigit()),
             "init_data should only contain hex digits"
@@ -1035,5 +1044,6 @@ mod tests {
         hex::decode(measurement).expect("measurement should be valid hex");
         hex::decode(report_data).expect("report_data should be valid hex");
         hex::decode(init_data).expect("init_data should be valid hex");
+        hex::decode(init_data_hash).expect("init_data_hash should be valid hex");
     }
 }

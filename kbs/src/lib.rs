@@ -22,5 +22,6 @@ pub use error::*;
 pub mod admin;
 pub mod http;
 pub mod jwe;
+pub(crate) mod policy_artifact;
 
 pub mod prometheus;

@@ -6,16 +6,17 @@ use std::collections::HashMap;
 use std::fs;
 
 use actix_web::{
-    http::{header::Header, Method},
+    http::{header, Method},
     middleware,
     web::{self, Query},
     App, HttpRequest, HttpResponse, HttpServer,
 };
-use actix_web_httpauth::headers::authorization::{Authorization, Bearer};
 use anyhow::Context;
 use base64::Engine;
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use policy_engine::{rego::Regorus, PolicyEngine};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 
 use crate::{
@@ -23,6 +24,7 @@ use crate::{
     config::KbsConfig,
     jwe::jwe,
     plugins::PluginManager,
+    policy_artifact,
     prometheus::{
         ACTIVE_CONNECTIONS, BUILD_INFO, KBS_POLICY_APPROVALS, KBS_POLICY_ERRORS, KBS_POLICY_EVALS,
         KBS_POLICY_VIOLATIONS, REQUEST_DURATION, REQUEST_SIZES, REQUEST_TOTAL,
@@ -84,16 +86,70 @@ impl ApiServer {
             return Ok(token);
         }
 
-        let bearer = Authorization::<Bearer>::parse(request)
-            .context("parse Authorization header failed")?
-            .into_scheme();
+        Self::get_authorization_token(request)
+    }
 
-        let token = bearer.token().to_string();
+    fn get_authorization_token(request: &HttpRequest) -> anyhow::Result<String> {
+        let value = request
+            .headers()
+            .get(header::AUTHORIZATION)
+            .context("Authorization header not found")?
+            .to_str()
+            .context("Authorization header is not valid UTF-8")?;
 
-        Ok(token)
+        let (scheme, token) = value
+            .split_once(' ')
+            .ok_or_else(|| anyhow::anyhow!("Authorization header has no scheme"))?;
+        if token.is_empty() {
+            anyhow::bail!("Authorization token is empty");
+        }
+
+        if scheme.eq_ignore_ascii_case("Bearer") || scheme.eq_ignore_ascii_case("Attestation") {
+            return Ok(token.to_string());
+        }
+
+        anyhow::bail!("unsupported Authorization scheme {scheme}");
+    }
+
+    async fn verified_resource_policy_rego(&self) -> Result<String> {
+        let stored_policy = self.policy_engine.get_policy(KBS_POLICY_ID).await?;
+        policy_artifact::rego_for_evaluation(&self.config.policy_engine, &stored_policy)
+            .map_err(|source| Error::ParsePolicyError { source })
+    }
+
+    async fn verified_resource_policy_body(&self, policy_id: &str) -> Result<String> {
+        let stored_policy = self.policy_engine.get_policy(policy_id).await?;
+        if self.config.policy_engine.require_signed_policy {
+            let _ = policy_artifact::verify(&self.config.policy_engine, &stored_policy)
+                .map_err(|source| Error::ParsePolicyError { source })?;
+        }
+
+        Ok(stored_policy)
+    }
+
+    async fn evaluate_resource_policy(
+        &self,
+        policy_data: Option<&str>,
+        claim_str: &str,
+    ) -> Result<policy_engine::EvaluationResult> {
+        let policy = self.verified_resource_policy_rego().await?;
+        self.policy_engine
+            .engine
+            .evaluate(
+                policy_data,
+                claim_str,
+                &policy,
+                vec![KBS_POLICY_RULE],
+                vec![],
+            )
+            .await
+            .map_err(From::from)
     }
 
     pub async fn new(config: KbsConfig) -> Result<Self> {
+        policy_artifact::validate_config(&config.policy_engine)
+            .map_err(|source| Error::PolicyInitializationFailed { source })?;
+
         let plugin_manager = PluginManager::new(config.plugins.clone(), &config.storage_backend)
             .await
             .map_err(|e| Error::PluginManagerInitialization { source: e })?;
@@ -107,6 +163,9 @@ impl ApiServer {
             .map_err(|e| Error::StorageBackendInitialization { source: e })?;
         let policy_engine = PolicyEngine::new(policy_storage_backend);
         let startup_policy = Self::startup_policy(&config)?;
+        let startup_policy =
+            policy_artifact::policy_for_storage(&config.policy_engine, &startup_policy)
+                .map_err(|source| Error::PolicyInitializationFailed { source })?;
 
         policy_engine
             .set_policy(KBS_POLICY_ID, &startup_policy, true)
@@ -259,6 +318,13 @@ pub(crate) async fn api(
             .attest(&body, request)
             .await
             .map_err(From::from),
+        "attestation" if request.method() == Method::POST && resource_path == ["verify"] => {
+            let token = attestation_verify_token(&request, &body)?;
+            let claims = core.token_verifier.verify(token).await?;
+            Ok(HttpResponse::Ok()
+                .content_type("application/json")
+                .body(serde_json::to_string(&claims)?))
+        }
         #[cfg(feature = "as")]
         "attestation-policy" if request.method() == Method::POST => {
             core.admin.check_admin_access(&request)?;
@@ -333,12 +399,48 @@ pub(crate) async fn api(
             let policy = String::from_utf8(policy_slice).map_err(|e| Error::ParsePolicyError {
                 source: anyhow::anyhow!("Failed to decode policy: {e}"),
             })?;
+            let policy = policy_artifact::policy_for_storage(&core.config.policy_engine, &policy)
+                .map_err(|source| Error::ParsePolicyError { source })?;
 
             core.policy_engine
                 .set_policy(KBS_POLICY_ID, &policy, true)
                 .await?;
 
             Ok(HttpResponse::Ok().finish())
+        }
+        "resource-policy"
+            if request.method() == Method::GET
+                && resource_path.len() == 2
+                && resource_path[1] == "body" =>
+        {
+            let policy_id = resource_path[0];
+            let token = core
+                .get_attestation_token(&request)
+                .await
+                .map_err(|_| Error::TokenNotFound)?;
+            let claims = core.token_verifier.verify(token).await?;
+            let claim_str = serde_json::to_string(&claims)?;
+            let policy_data = build_policy_body_policy_data(
+                policy_id,
+                query.get("resource_path").map(String::as_str),
+            );
+            let policy_data_str = policy_data.to_string();
+
+            KBS_POLICY_EVALS.inc();
+            let policy_result = core
+                .evaluate_resource_policy(Some(&policy_data_str), &claim_str)
+                .await
+                .inspect_err(|_| KBS_POLICY_ERRORS.inc())?;
+            if !policy_allows(&policy_result) {
+                KBS_POLICY_VIOLATIONS.inc();
+                return Err(Error::PolicyDeny);
+            }
+            KBS_POLICY_APPROVALS.inc();
+
+            let policy = core.verified_resource_policy_body(policy_id).await?;
+            Ok(HttpResponse::Ok()
+                .content_type("application/json")
+                .body(policy))
         }
         // TODO: consider to rename the api name for it is not only for
         // resource retrievement but for all plugins.
@@ -387,33 +489,11 @@ pub(crate) async fn api(
 
                 KBS_POLICY_EVALS.inc();
                 // TODO: add policy filter support for other plugins
-                if !core
-                    .policy_engine
-                    .evaluate_rego(
-                        Some(&policy_data_str),
-                        &claim_str,
-                        KBS_POLICY_ID,
-                        vec![KBS_POLICY_RULE],
-                        vec![],
-                    )
+                let policy_result = core
+                    .evaluate_resource_policy(Some(&policy_data_str), &claim_str)
                     .await
-                    .inspect_err(|_| KBS_POLICY_ERRORS.inc())?
-                    .eval_rules_result
-                    .get(KBS_POLICY_RULE)
-                    .expect("`data.policy.allow` rule not put as parameter found")
-                    .as_ref()
-                    .unwrap_or_else(|| {
-                        warn!("The KBS Resource Policy does not define the `{KBS_POLICY_RULE}` rule, use false as default" );
-                        KBS_POLICY_ERRORS.inc();
-                        &serde_json::Value::Bool(false)
-                    })
-                    .as_bool()
-                    .unwrap_or_else(|| {
-                        warn!("`{KBS_POLICY_RULE}` rule result is not a boolean, use false as default");
-                        KBS_POLICY_ERRORS.inc();
-                        false
-                    })
-                {
+                    .inspect_err(|_| KBS_POLICY_ERRORS.inc())?;
+                if !policy_allows(&policy_result) {
                     KBS_POLICY_VIOLATIONS.inc();
                     return Err(Error::PolicyDeny);
                 }
@@ -445,13 +525,306 @@ pub(crate) async fn api(
 
 /// Build method-aware policy data for workload-resource endpoint.
 /// Extracted as a helper for unit testing.
+#[cfg(test)]
 pub(crate) fn build_workload_policy_data(method: &str, path_parts: &[&str]) -> serde_json::Value {
+    build_workload_policy_data_with_body(method, path_parts, &[], &serde_json::Value::Null)
+}
+
+pub(crate) fn build_workload_policy_data_with_body(
+    method: &str,
+    path_parts: &[&str],
+    body: &[u8],
+    claims: &serde_json::Value,
+) -> serde_json::Value {
+    let body_sha256 = sha256_hex(body);
+    let parsed_body = workload_request_body_policy_input(body, claims);
+
     json!({
         "plugin": "workload-resource",
         "resource-path": path_parts,
         "query": {},
         "method": method,
+        "request": {
+            "method": method,
+            "body_sha256": body_sha256,
+            "body": parsed_body,
+        },
     })
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct WorkloadRequestBody {
+    operation: String,
+    receipt: Option<WorkloadReceipt>,
+    value: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct WorkloadReceipt {
+    pubkey: String,
+    payload_canonical_bytes: String,
+    signature: String,
+}
+
+fn workload_request_body_policy_input(
+    body: &[u8],
+    claims: &serde_json::Value,
+) -> serde_json::Value {
+    if body.is_empty() {
+        return serde_json::Value::Null;
+    }
+
+    match parse_workload_request_body(body, claims) {
+        Ok(value) => value,
+        Err(err) => json!({
+            "parse_error": err.to_string(),
+            "receipt": {
+                "pubkey_hash_matches": false,
+                "signature_valid": false,
+                "payload": {},
+            },
+            "value_hash_matches": false,
+        }),
+    }
+}
+
+fn parse_workload_request_body(
+    body: &[u8],
+    claims: &serde_json::Value,
+) -> anyhow::Result<serde_json::Value> {
+    let parsed: WorkloadRequestBody = serde_json::from_slice(body)?;
+    let mut receipt_value = json!({
+        "pubkey_hash_matches": false,
+        "signature_valid": false,
+        "payload": {},
+    });
+
+    let mut value_hash_matches = false;
+    if let Some(receipt) = parsed.receipt {
+        let pubkey = policy_artifact::decode_bytes(&receipt.pubkey)?;
+        let payload = policy_artifact::decode_bytes(&receipt.payload_canonical_bytes)?;
+        let signature = policy_artifact::decode_bytes(&receipt.signature)?;
+
+        let pubkey_hash_matches = receipt_pubkey_hash_from_claims(claims)
+            .map(|expected| sha256_bytes(&pubkey) == expected)
+            .unwrap_or(false);
+        let signature_valid = verify_ed25519(&pubkey, &payload, &signature);
+        let payload_fields = receipt_payload_policy_fields(&payload)?;
+
+        if let (Some(value), Some(expected_hash)) = (
+            parsed.value.as_deref(),
+            payload_fields
+                .get("new_value_sha256")
+                .and_then(|value| value.as_str()),
+        ) {
+            let value = policy_artifact::decode_bytes(value)?;
+            if let Ok(expected_hash) = hex::decode(expected_hash) {
+                value_hash_matches = sha256_bytes(&value).as_slice() == expected_hash.as_slice();
+            }
+        }
+
+        receipt_value = json!({
+            "pubkey_hash_matches": pubkey_hash_matches,
+            "signature_valid": signature_valid,
+            "payload": payload_fields,
+        });
+    }
+
+    Ok(json!({
+        "operation": parsed.operation,
+        "receipt": receipt_value,
+        "value_hash_matches": value_hash_matches,
+    }))
+}
+
+fn workload_resource_value_for_storage(body: &[u8]) -> Result<Vec<u8>> {
+    if let Ok(parsed) = serde_json::from_slice::<WorkloadRequestBody>(body) {
+        if let Some(value) = parsed.value {
+            return policy_artifact::decode_bytes(&value)
+                .map_err(|source| Error::PluginInternalError { source });
+        }
+    }
+
+    Ok(body.to_vec())
+}
+
+fn receipt_payload_policy_fields(payload: &[u8]) -> anyhow::Result<serde_json::Value> {
+    let records = policy_artifact::decode_ce_v1_records(payload)?;
+    let mut fields = serde_json::Map::new();
+
+    for (label, value) in records {
+        let value = if label.ends_with("_sha256") {
+            serde_json::Value::String(hex::encode(value))
+        } else if let Ok(value) = String::from_utf8(value.clone()) {
+            serde_json::Value::String(value)
+        } else {
+            serde_json::Value::String(hex::encode(value))
+        };
+        fields.insert(label, value);
+    }
+
+    Ok(serde_json::Value::Object(fields))
+}
+
+fn verify_ed25519(pubkey: &[u8], message: &[u8], signature: &[u8]) -> bool {
+    let Ok(pubkey) = <[u8; 32]>::try_from(pubkey) else {
+        return false;
+    };
+    let Ok(signature) = <[u8; 64]>::try_from(signature) else {
+        return false;
+    };
+    let Ok(pubkey) = VerifyingKey::from_bytes(&pubkey) else {
+        return false;
+    };
+    let signature = Signature::from_bytes(&signature);
+    pubkey.verify(message, &signature).is_ok()
+}
+
+fn receipt_pubkey_hash_from_claims(claims: &serde_json::Value) -> Option<[u8; 32]> {
+    find_claim_string(claims, "receipt_pubkey_sha256")
+        .and_then(decode_hex_array::<32>)
+        .or_else(|| {
+            let report_data = find_claim_string(claims, "report_data")?;
+            let report_data = hex::decode(report_data).ok()?;
+            if report_data.len() != 64 {
+                return None;
+            }
+            let mut hash = [0u8; 32];
+            hash.copy_from_slice(&report_data[32..64]);
+            Some(hash)
+        })
+}
+
+fn find_claim_string<'a>(value: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+    match value {
+        serde_json::Value::Object(map) => {
+            if let Some(value) = map.get(key).and_then(|value| value.as_str()) {
+                return Some(value);
+            }
+            map.values().find_map(|value| find_claim_string(value, key))
+        }
+        serde_json::Value::Array(values) => values
+            .iter()
+            .find_map(|value| find_claim_string(value, key)),
+        _ => None,
+    }
+}
+
+fn decode_hex_array<const N: usize>(value: &str) -> Option<[u8; N]> {
+    let bytes = hex::decode(value).ok()?;
+    bytes.try_into().ok()
+}
+
+fn sha256_bytes(value: &[u8]) -> [u8; 32] {
+    Sha256::digest(value).into()
+}
+
+fn sha256_hex(value: &[u8]) -> String {
+    hex::encode(sha256_bytes(value))
+}
+
+pub(crate) fn build_policy_body_policy_data(
+    policy_id: &str,
+    resource_path: Option<&str>,
+) -> serde_json::Value {
+    let resource_path: Vec<&str> = resource_path
+        .map(|path| path.split('/').filter(|part| !part.is_empty()).collect())
+        .unwrap_or_else(|| vec![policy_id, "body"]);
+
+    json!({
+        "plugin": if resource_path.len() == 3 { "resource" } else { "resource-policy" },
+        "resource-path": resource_path,
+        "query": {},
+        "method": "GET",
+    })
+}
+
+fn policy_allows(policy_result: &policy_engine::EvaluationResult) -> bool {
+    policy_result
+        .eval_rules_result
+        .get(KBS_POLICY_RULE)
+        .expect("`data.policy.allow` rule not put as parameter found")
+        .as_ref()
+        .unwrap_or_else(|| {
+            warn!(
+                "The KBS Resource Policy does not define the `{KBS_POLICY_RULE}` rule, use false as default"
+            );
+            KBS_POLICY_ERRORS.inc();
+            &serde_json::Value::Bool(false)
+        })
+        .as_bool()
+        .unwrap_or_else(|| {
+            warn!("`{KBS_POLICY_RULE}` rule result is not a boolean, use false as default");
+            KBS_POLICY_ERRORS.inc();
+            false
+        })
+}
+
+fn attestation_verify_token(request: &HttpRequest, body: &[u8]) -> Result<String> {
+    if !body.is_empty() {
+        let value: serde_json::Value = serde_json::from_slice(body)?;
+        if let Some(token) = value.get("token").and_then(|value| value.as_str()) {
+            return Ok(token.to_string());
+        }
+    }
+
+    ApiServer::get_authorization_token(request).map_err(|_| Error::TokenNotFound)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkloadResourceCondition {
+    CreateIfAbsent,
+    ReplaceIfPresent,
+    DeleteIfPresent,
+}
+
+impl WorkloadResourceCondition {
+    fn query_value(self) -> &'static str {
+        match self {
+            Self::CreateIfAbsent => crate::plugins::resource::WORKLOAD_RESOURCE_CONDITION_CREATE,
+            Self::ReplaceIfPresent => crate::plugins::resource::WORKLOAD_RESOURCE_CONDITION_REPLACE,
+            Self::DeleteIfPresent => crate::plugins::resource::WORKLOAD_RESOURCE_CONDITION_DELETE,
+        }
+    }
+}
+
+fn workload_resource_condition_from_headers(
+    request: &HttpRequest,
+) -> Result<WorkloadResourceCondition> {
+    let if_none_match = request
+        .headers()
+        .get(header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok());
+    let if_match = request
+        .headers()
+        .get(header::IF_MATCH)
+        .and_then(|value| value.to_str().ok());
+
+    match *request.method() {
+        Method::PUT => match (if_none_match, if_match) {
+            (Some("*"), None) => Ok(WorkloadResourceCondition::CreateIfAbsent),
+            (None, Some("*")) => Ok(WorkloadResourceCondition::ReplaceIfPresent),
+            _ => Err(Error::PreconditionFailed),
+        },
+        Method::DELETE => match (if_none_match, if_match) {
+            (None, Some("*")) => Ok(WorkloadResourceCondition::DeleteIfPresent),
+            _ => Err(Error::PreconditionFailed),
+        },
+        _ => Err(Error::InvalidRequestPath {
+            path: request.path().to_string(),
+        }),
+    }
+}
+
+fn map_workload_resource_plugin_error(source: anyhow::Error) -> Error {
+    if source
+        .chain()
+        .any(|err| err.to_string().contains("resource precondition failed:"))
+    {
+        Error::PreconditionFailed
+    } else {
+        Error::PluginInternalError { source }
+    }
 }
 
 /// Workload-authenticated ciphertext CRUD endpoint.
@@ -496,6 +869,8 @@ pub(crate) async fn workload_resource_api(
         return Err(Error::PolicyDeny);
     }
 
+    let resource_condition = workload_resource_condition_from_headers(&request)?;
+
     // Authenticate via attestation token (Bearer or session)
     let token = core
         .get_attestation_token(&request)
@@ -505,40 +880,17 @@ pub(crate) async fn workload_resource_api(
     let claim_str = serde_json::to_string(&claims)?;
 
     // Construct method-aware policy data
-    let policy_data = build_workload_policy_data(method.as_str(), &path_parts);
+    let policy_data =
+        build_workload_policy_data_with_body(method.as_str(), &path_parts, &body, &claims);
     let policy_data_str = policy_data.to_string();
 
     // Evaluate OPA policy (same pattern as existing api() handler)
     KBS_POLICY_EVALS.inc();
     let policy_result = core
-        .policy_engine
-        .evaluate_rego(
-            Some(&policy_data_str),
-            &claim_str,
-            KBS_POLICY_ID,
-            vec![KBS_POLICY_RULE],
-            vec![],
-        )
+        .evaluate_resource_policy(Some(&policy_data_str), &claim_str)
         .await
         .inspect_err(|_| KBS_POLICY_ERRORS.inc())?;
-    let allowed = policy_result
-        .eval_rules_result
-        .get(KBS_POLICY_RULE)
-        .expect("`data.policy.allow` rule not put as parameter found")
-        .as_ref()
-        .unwrap_or_else(|| {
-            warn!(
-                "The KBS Resource Policy does not define the `{KBS_POLICY_RULE}` rule, use false as default"
-            );
-            KBS_POLICY_ERRORS.inc();
-            &serde_json::Value::Bool(false)
-        })
-        .as_bool()
-        .unwrap_or_else(|| {
-            warn!("`{KBS_POLICY_RULE}` rule result is not a boolean, use false as default");
-            KBS_POLICY_ERRORS.inc();
-            false
-        });
+    let allowed = policy_allows(&policy_result);
     if !allowed {
         warn!(
             method = %method,
@@ -560,8 +912,16 @@ pub(crate) async fn workload_resource_api(
         .ok_or(Error::PluginNotFound {
             plugin_name: "resource".into(),
         })?;
-    let body_vec = body.to_vec();
-    let query = std::collections::HashMap::new();
+    let mut query = std::collections::HashMap::new();
+    query.insert(
+        crate::plugins::resource::WORKLOAD_RESOURCE_CONDITION_QUERY.to_string(),
+        resource_condition.query_value().to_string(),
+    );
+    let body_vec = if method == Method::PUT {
+        workload_resource_value_for_storage(&body)?
+    } else {
+        body.to_vec()
+    };
     let dispatch_method = if method == Method::PUT {
         Method::POST
     } else {
@@ -570,7 +930,7 @@ pub(crate) async fn workload_resource_api(
     resource_plugin
         .handle(&body_vec, &query, &path_parts, &dispatch_method)
         .await
-        .map_err(|e| Error::PluginInternalError { source: e })?;
+        .map_err(map_workload_resource_plugin_error)?;
 
     Ok(HttpResponse::Ok().finish())
 }
@@ -634,6 +994,9 @@ async fn prometheus_metrics_middleware(
 #[cfg(test)]
 mod workload_resource_tests {
     use super::*;
+    use base64::engine::general_purpose::STANDARD;
+    use ed25519_dalek::{Signer, SigningKey};
+    use key_value_storage::{KeyValueStorageStructConfig, KeyValueStorageType};
 
     #[test]
     fn test_workload_resource_path_must_have_three_segments() {
@@ -650,7 +1013,7 @@ mod workload_resource_tests {
     #[test]
     fn test_workload_resource_owner_suffix_required() {
         // Path without -owner suffix should be rejected
-        let path_parts = vec!["default", "test-notowner", "seed-encrypted"];
+        let path_parts = ["default", "test-notowner", "seed-encrypted"];
         assert!(
             !path_parts[1].ends_with("-owner"),
             "path without -owner suffix should fail the check"
@@ -660,7 +1023,7 @@ mod workload_resource_tests {
     #[test]
     fn test_workload_resource_owner_suffix_accepted() {
         // Path with -owner suffix should pass
-        let path_parts = vec!["default", "test-owner", "seed-encrypted"];
+        let path_parts = ["default", "test-owner", "seed-encrypted"];
         assert!(
             path_parts[1].ends_with("-owner"),
             "path with -owner suffix should pass the check"
@@ -719,6 +1082,209 @@ mod workload_resource_tests {
             build_workload_policy_data("DELETE", &["default", "test-owner", "seed-encrypted"]);
         assert_eq!(policy_data["method"], "DELETE");
         assert_eq!(policy_data["plugin"], "workload-resource");
+    }
+
+    #[test]
+    fn test_workload_resource_policy_data_includes_verified_receipt_fields() {
+        let signing_key = SigningKey::from_bytes(&[9u8; 32]);
+        let receipt_pubkey = signing_key.verifying_key().to_bytes();
+        let value = b"new encrypted seed";
+        let value_hash = sha256_bytes(value);
+        let payload = policy_artifact::ce_v1_bytes(&[
+            ("purpose", b"enclava-rekey-v1"),
+            ("resource_path", b"default/test-owner/seed-encrypted"),
+            ("new_value_sha256", value_hash.as_slice()),
+            ("timestamp", b"2026-04-28T00:00:00Z"),
+        ]);
+        let signature = signing_key.sign(&payload).to_bytes();
+        let body = serde_json::to_vec(&json!({
+            "operation": "rekey",
+            "receipt": {
+                "pubkey": STANDARD.encode(receipt_pubkey),
+                "payload_canonical_bytes": STANDARD.encode(&payload),
+                "signature": STANDARD.encode(signature),
+            },
+            "value": STANDARD.encode(value),
+        }))
+        .unwrap();
+        let mut report_data = [0u8; 64];
+        report_data[32..64].copy_from_slice(&sha256_bytes(&receipt_pubkey));
+        let claims = json!({
+            "submods": {
+                "cpu0": {
+                    "ear.veraison.annotated-evidence": {
+                        "report_data": hex::encode(report_data)
+                    }
+                }
+            }
+        });
+
+        let policy_data = build_workload_policy_data_with_body(
+            "PUT",
+            &["default", "test-owner", "seed-encrypted"],
+            &body,
+            &claims,
+        );
+
+        assert_eq!(policy_data["request"]["method"], "PUT");
+        assert_eq!(
+            policy_data["request"]["body_sha256"],
+            hex::encode(sha256_bytes(&body))
+        );
+        assert_eq!(policy_data["request"]["body"]["operation"], "rekey");
+        assert_eq!(
+            policy_data["request"]["body"]["receipt"]["pubkey_hash_matches"],
+            true
+        );
+        assert_eq!(
+            policy_data["request"]["body"]["receipt"]["signature_valid"],
+            true
+        );
+        assert_eq!(policy_data["request"]["body"]["value_hash_matches"], true);
+        assert_eq!(
+            policy_data["request"]["body"]["receipt"]["payload"]["new_value_sha256"],
+            hex::encode(value_hash)
+        );
+    }
+
+    #[test]
+    fn test_workload_resource_policy_data_rejects_forged_receipt_pubkey_binding() {
+        let signing_key = SigningKey::from_bytes(&[9u8; 32]);
+        let receipt_pubkey = signing_key.verifying_key().to_bytes();
+        let payload = policy_artifact::ce_v1_bytes(&[("purpose", b"enclava-teardown-v1")]);
+        let signature = signing_key.sign(&payload).to_bytes();
+        let body = serde_json::to_vec(&json!({
+            "operation": "teardown",
+            "receipt": {
+                "pubkey": STANDARD.encode(receipt_pubkey),
+                "payload_canonical_bytes": STANDARD.encode(&payload),
+                "signature": STANDARD.encode(signature),
+            }
+        }))
+        .unwrap();
+        let claims = json!({
+            "report_data": hex::encode([0u8; 64])
+        });
+
+        let policy_data = build_workload_policy_data_with_body(
+            "DELETE",
+            &["default", "test-owner", "seed-encrypted"],
+            &body,
+            &claims,
+        );
+
+        assert_eq!(
+            policy_data["request"]["body"]["receipt"]["pubkey_hash_matches"],
+            false
+        );
+        assert_eq!(
+            policy_data["request"]["body"]["receipt"]["signature_valid"],
+            true
+        );
+    }
+
+    #[test]
+    fn test_workload_resource_value_for_storage_extracts_rekey_value() {
+        let body = serde_json::to_vec(&json!({
+            "operation": "rekey",
+            "value": STANDARD.encode(b"ciphertext")
+        }))
+        .unwrap();
+
+        let stored = workload_resource_value_for_storage(&body).unwrap();
+
+        assert_eq!(stored, b"ciphertext");
+    }
+
+    #[test]
+    fn test_if_none_match_star_selects_create_condition() {
+        let request = actix_web::test::TestRequest::put()
+            .insert_header((header::IF_NONE_MATCH, "*"))
+            .to_http_request();
+
+        assert_eq!(
+            workload_resource_condition_from_headers(&request).unwrap(),
+            WorkloadResourceCondition::CreateIfAbsent
+        );
+    }
+
+    #[test]
+    fn test_if_match_star_selects_replace_condition() {
+        let request = actix_web::test::TestRequest::put()
+            .insert_header((header::IF_MATCH, "*"))
+            .to_http_request();
+
+        assert_eq!(
+            workload_resource_condition_from_headers(&request).unwrap(),
+            WorkloadResourceCondition::ReplaceIfPresent
+        );
+    }
+
+    #[test]
+    fn test_workload_resource_put_without_condition_fails_closed() {
+        let request = actix_web::test::TestRequest::put().to_http_request();
+
+        assert!(matches!(
+            workload_resource_condition_from_headers(&request).unwrap_err(),
+            Error::PreconditionFailed
+        ));
+    }
+
+    #[test]
+    fn test_workload_resource_delete_requires_if_match_star() {
+        let request = actix_web::test::TestRequest::delete()
+            .insert_header((header::IF_NONE_MATCH, "*"))
+            .to_http_request();
+
+        assert!(matches!(
+            workload_resource_condition_from_headers(&request).unwrap_err(),
+            Error::PreconditionFailed
+        ));
+    }
+
+    #[test]
+    fn test_policy_body_policy_data_uses_resource_path_when_supplied() {
+        let policy_data = build_policy_body_policy_data(
+            "resource-policy",
+            Some("default/test-owner/seed-encrypted"),
+        );
+
+        assert_eq!(policy_data["plugin"], "resource");
+        assert_eq!(policy_data["method"], "GET");
+        assert_eq!(policy_data["resource-path"][0], "default");
+        assert_eq!(policy_data["resource-path"][1], "test-owner");
+        assert_eq!(policy_data["resource-path"][2], "seed-encrypted");
+    }
+
+    #[tokio::test]
+    async fn test_direct_injected_unsigned_policy_is_rejected_before_evaluation() {
+        let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+        let config = crate::config::PolicyEngineConfig {
+            require_signed_policy: true,
+            signed_policy_public_key: Some(hex::encode(signing_key.verifying_key().to_bytes())),
+            ..Default::default()
+        };
+        let storage = KeyValueStorageStructConfig::default()
+            .to_client_with_namespace(KeyValueStorageType::Memory, KBS_STORAGE_NAMESPACE)
+            .await
+            .unwrap();
+        let policy_engine = PolicyEngine::new(storage);
+        policy_engine
+            .set_policy(
+                KBS_POLICY_ID,
+                "package policy\n\ndefault allow := true\n",
+                true,
+            )
+            .await
+            .unwrap();
+
+        let stored = policy_engine.get_policy(KBS_POLICY_ID).await.unwrap();
+        let err = policy_artifact::rego_for_evaluation(&config, &stored).unwrap_err();
+
+        assert!(
+            err.to_string().contains("parse signed policy artifact"),
+            "{err:?}"
+        );
     }
 
     #[test]

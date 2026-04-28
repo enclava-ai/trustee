@@ -14,7 +14,10 @@ use serde::Deserialize;
 use tokio::sync::RwLock;
 use tracing::{debug, instrument};
 
-use crate::{KeyValueStorage, KeyValueStorageError, Result, SetParameters, SetResult};
+use crate::{
+    DeleteResult, KeyValueStorage, KeyValueStorageError, Result, SetParameters, SetResult,
+    UpdateResult,
+};
 
 /// Default file directory path for the local JSON file.
 const FILE_DIR_PATH: &str = "/opt/confidential-containers/storage/local_json";
@@ -81,7 +84,7 @@ impl KeyValueStorage for LocalJson {
         let mut items: HashMap<String, String> = serde_json::from_slice(&file)
             .map_err(|e| KeyValueStorageError::MalformedValue { source: e.into() })?;
         let value_b64 = URL_SAFE.encode(value);
-        if parameters.overwrite && items.contains_key(key) {
+        if !parameters.overwrite && items.contains_key(key) {
             return Ok(SetResult::AlreadyExists);
         }
 
@@ -99,6 +102,37 @@ impl KeyValueStorage for LocalJson {
                 key: key.to_string(),
             })?;
         Ok(SetResult::Inserted)
+    }
+
+    #[instrument(skip_all, name = "LocalJson::update_if_present", fields(key = key))]
+    async fn update_if_present(&self, key: &str, value: &[u8]) -> Result<UpdateResult> {
+        let _ = self.lock.write().await;
+        let file = tokio::fs::read(&self.file_path).await.map_err(|e| {
+            KeyValueStorageError::GetKeyFailed {
+                source: e.into(),
+                key: key.to_string(),
+            }
+        })?;
+        let mut items: HashMap<String, String> = serde_json::from_slice(&file)
+            .map_err(|e| KeyValueStorageError::MalformedValue { source: e.into() })?;
+        if !items.contains_key(key) {
+            return Ok(UpdateResult::NotFound);
+        }
+
+        items.insert(key.to_string(), URL_SAFE.encode(value));
+
+        let new_contents =
+            serde_json::to_string(&items).map_err(|e| KeyValueStorageError::SetKeyFailed {
+                source: e.into(),
+                key: key.to_string(),
+            })?;
+        tokio::fs::write(&self.file_path, new_contents)
+            .await
+            .map_err(|e| KeyValueStorageError::SetKeyFailed {
+                source: e.into(),
+                key: key.to_string(),
+            })?;
+        Ok(UpdateResult::Updated)
     }
 
     #[instrument(skip_all, name = "LocalJson::get", fields(key = key))]
@@ -174,6 +208,43 @@ impl KeyValueStorage for LocalJson {
                 key: key.to_string(),
             })?;
         Ok(value)
+    }
+
+    #[instrument(skip_all, name = "LocalJson::delete_if_present", fields(key = key))]
+    async fn delete_if_present(&self, key: &str) -> Result<DeleteResult> {
+        let _ = self.lock.write().await;
+        let file = tokio::fs::read(&self.file_path).await.map_err(|e| {
+            KeyValueStorageError::GetKeyFailed {
+                source: e.into(),
+                key: key.to_string(),
+            }
+        })?;
+        let mut items: HashMap<String, String> =
+            serde_json::from_slice(&file).map_err(|e| KeyValueStorageError::DeleteKeyFailed {
+                key: key.to_string(),
+                source: anyhow::anyhow!("failed to deserialize the file: {}", e),
+            })?;
+        let Some(value) = items.remove(key) else {
+            return Ok(DeleteResult::NotFound);
+        };
+        let value = URL_SAFE
+            .decode(value)
+            .map_err(|e| KeyValueStorageError::DeleteKeyFailed {
+                source: anyhow::anyhow!("failed to base64 decode value: {e}"),
+                key: key.to_string(),
+            })?;
+        let contents =
+            serde_json::to_vec(&items).map_err(|e| KeyValueStorageError::DeleteKeyFailed {
+                key: key.to_string(),
+                source: e.into(),
+            })?;
+        tokio::fs::write(&self.file_path, contents)
+            .await
+            .map_err(|e| KeyValueStorageError::DeleteKeyFailed {
+                source: anyhow::anyhow!("failed to write back to the file: {}", e),
+                key: key.to_string(),
+            })?;
+        Ok(DeleteResult::Deleted(value))
     }
 }
 

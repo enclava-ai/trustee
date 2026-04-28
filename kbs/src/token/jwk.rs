@@ -269,7 +269,7 @@ mod tests {
         let tmp_dir = tempfile::tempdir().expect("to get tmpdir");
         let jwks_file = tmp_dir.path().join("test.jwks");
 
-        let _ = std::fs::write(&jwks_file, json).expect("to get testdata written to tmpdir");
+        std::fs::write(&jwks_file, json).expect("to get testdata written to tmpdir");
 
         let p = "file://".to_owned() + jwks_file.to_str().expect("to get path as str");
         let jwtks = get_jwks_from_file_or_url(&p).await.expect("to get jwks");

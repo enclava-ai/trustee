@@ -21,6 +21,34 @@ defined below:
 The KBS root file system resource path is specified in the KBS config file
 as well, and the default value is `/opt/confidential-containers/kbs/repository`.
 
+### Workload Resource Conditional Writes
+
+The workload-owned resource endpoint (`PUT`/`DELETE /kbs/v0/workload-resource/...`)
+requires HTTP preconditions:
+
+| Operation | Required header | Backend behavior |
+| --------- | --------------- | ---------------- |
+| First write | `If-None-Match: *` | Create only when the resource is absent. |
+| Rekey/replace | `If-Match: *` | Replace only when the resource is present. |
+| Delete | `If-Match: *` | Delete only when the resource is present. |
+
+Requests without one of these headers fail closed with `412 Precondition Failed`.
+For the key-value backed resource repository, first write uses the storage
+backend's insert-if-absent path (`SetParameters { overwrite: false }`), replace
+uses `update_if_present`, and delete uses `delete_if_present`. These operations
+are a single storage operation for PostgreSQL and are protected by backend locks
+for the in-process backends. The resource local-file backend uses `create_new`
+for first-write atomicity and serializes conditional replace/delete in process.
+
+Remaining gap: resource storage does not yet expose per-resource versions or
+ETags. The workload-resource HTTP adapter only accepts wildcard preconditions
+(`If-None-Match: *` / `If-Match: *`) and forwards an enum condition to the
+resource plugin; `KeyValueStorage` stores only key/value bytes and does not
+return version metadata from reads or writes. Because there is no end-to-end
+version value to compare, `If-Match: *` is an existence precondition, not a full
+compare-and-set against a specific version. Backends that do not override the
+conditional methods fail closed for workload-resource conditional operations.
+
 ### Aliyun KMS
 
 [Alibaba Cloud KMS](https://www.alibabacloud.com/en/product/kms?_p_lc=1)(a.k.a Aliyun KMS)

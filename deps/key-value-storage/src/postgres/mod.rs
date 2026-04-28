@@ -17,7 +17,8 @@ use sqlx::{postgres::PgPoolOptions, query, Row};
 use tracing::{debug, info, instrument};
 
 use crate::{
-    is_valid_key, KeyValueStorage, KeyValueStorageError, Result, SetParameters, SetResult,
+    is_valid_key, DeleteResult, KeyValueStorage, KeyValueStorageError, Result, SetParameters,
+    SetResult, UpdateResult,
 };
 
 /// The maximum number of connections to the PostgreSQL database.
@@ -159,6 +160,35 @@ impl KeyValueStorage for PostgresClient {
         Ok(SetResult::Inserted)
     }
 
+    #[instrument(skip_all, name = "PostgresClient::update_if_present")]
+    async fn update_if_present(&self, key: &str, value: &[u8]) -> Result<UpdateResult> {
+        if !is_valid_key(key) {
+            return Err(KeyValueStorageError::SetKeyFailed {
+                source: anyhow::anyhow!("key contains invalid characters"),
+                key: key.to_string(),
+            });
+        }
+
+        let sql = format!(
+            "UPDATE {} SET {VALUE_COLUMN} = $2 WHERE {KEY_COLUMN} = $1",
+            self.table
+        );
+        let result = query(&sql)
+            .bind(key)
+            .bind(value)
+            .execute(&*self.pool)
+            .await
+            .map_err(|e| KeyValueStorageError::SetKeyFailed {
+                source: e.into(),
+                key: key.to_string(),
+            })?;
+        if result.rows_affected() == 0 {
+            return Ok(UpdateResult::NotFound);
+        }
+
+        Ok(UpdateResult::Updated)
+    }
+
     #[instrument(skip_all, name = "PostgresClient::list")]
     async fn list(&self) -> Result<Vec<String>> {
         let sql = format!("SELECT ({KEY_COLUMN}) FROM {}", self.table);
@@ -177,16 +207,16 @@ impl KeyValueStorage for PostgresClient {
         );
         let value = query(&sql)
             .bind(key)
-            .fetch_one(&*self.pool)
+            .fetch_optional(&*self.pool)
             .await
             .map_err(|e| KeyValueStorageError::GetKeyFailed {
                 source: e.into(),
                 key: key.to_string(),
             })?;
 
-        if value.is_empty() {
+        let Some(value) = value else {
             return Ok(None);
-        }
+        };
 
         let value: Vec<u8> = value
             .try_get(VALUE_COLUMN)
@@ -218,6 +248,31 @@ impl KeyValueStorage for PostgresClient {
 
         Ok(None)
     }
+
+    #[instrument(skip_all, name = "PostgresClient::delete_if_present")]
+    async fn delete_if_present(&self, key: &str) -> Result<DeleteResult> {
+        let sql = format!(
+            "DELETE FROM {} WHERE {KEY_COLUMN} = $1 RETURNING {VALUE_COLUMN}",
+            self.table
+        );
+        let row = query(&sql)
+            .bind(key)
+            .fetch_optional(&*self.pool)
+            .await
+            .map_err(|e| KeyValueStorageError::DeleteKeyFailed {
+                source: e.into(),
+                key: key.to_string(),
+            })?;
+
+        let Some(row) = row else {
+            return Ok(DeleteResult::NotFound);
+        };
+
+        let value: Vec<u8> = row
+            .try_get("value")
+            .map_err(|e| KeyValueStorageError::MalformedValue { source: e.into() })?;
+        Ok(DeleteResult::Deleted(value))
+    }
 }
 
 #[cfg(test)]
@@ -246,7 +301,7 @@ mod tests {
         let res = client
             .set("test", b"test2", SetParameters { overwrite: false })
             .await;
-        assert!(res.is_err());
+        assert!(matches!(res.unwrap(), SetResult::AlreadyExists));
         let value = client.delete("test").await.unwrap();
         assert_eq!(value, Some(b"test".to_vec()));
         let keys = client.list().await.unwrap();

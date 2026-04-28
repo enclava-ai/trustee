@@ -73,6 +73,9 @@ pub enum Error {
     #[error("Access denied by policy")]
     PolicyDeny,
 
+    #[error("Request precondition failed")]
+    PreconditionFailed,
+
     #[error("Failed to parse policy: {source}")]
     ParsePolicyError {
         #[source]
@@ -143,7 +146,9 @@ impl ResponseError for Error {
             Error::PluginInternalError { source } if plugin_internal_error_is_not_found(source) => {
                 HttpResponse::NotFound()
             }
+            Error::ParsePolicyError { .. } => HttpResponse::BadRequest(),
             Error::PayloadTooLarge => HttpResponse::PayloadTooLarge(),
+            Error::PreconditionFailed => HttpResponse::PreconditionFailed(),
             _ => HttpResponse::Unauthorized(),
         };
 
@@ -164,6 +169,7 @@ mod tests {
     #[case(Error::InvalidRequestPath{path: "test".into()})]
     #[case(Error::PluginNotFound{plugin_name: "test".into()})]
     #[case(Error::PayloadTooLarge)]
+    #[case(Error::PreconditionFailed)]
     fn into_error_response(#[case] err: Error) {
         let _ = actix_web::ResponseError::error_response(&err);
     }
@@ -175,6 +181,25 @@ mod tests {
         assert_eq!(
             resp.status(),
             actix_web::http::StatusCode::PAYLOAD_TOO_LARGE
+        );
+    }
+
+    #[test]
+    fn parse_policy_error_returns_400() {
+        let err = Error::ParsePolicyError {
+            source: anyhow!("bad policy"),
+        };
+        let resp = actix_web::ResponseError::error_response(&err);
+        assert_eq!(resp.status(), actix_web::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn precondition_failed_returns_412() {
+        let err = Error::PreconditionFailed;
+        let resp = actix_web::ResponseError::error_response(&err);
+        assert_eq!(
+            resp.status(),
+            actix_web::http::StatusCode::PRECONDITION_FAILED
         );
     }
 
