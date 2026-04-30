@@ -1,13 +1,23 @@
 name: Staged Images
 
 on:
+  workflow_dispatch:
+    inputs:
+      image_group:
+        description: "Which staged image set to build"
+        type: choice
+        required: true
+        default: all
+        options:
+          - all
+          - kbs
+          - as
+          - kbs-client
+          - rvps
   pull_request:
     branches: ["main"]
     paths-ignore:
       - '**/*.md'
-  push:
-    branches:
-      - main
 
 permissions: {}
 
@@ -22,21 +32,21 @@ jobs:
       image_group: all
 
   build_staged_images_push:
-    name: Build staged images (all) [push]
-    if: github.event_name == 'push'
+    name: Build staged images (manual)
+    if: github.event_name == 'workflow_dispatch'
     permissions:
       packages: write
       contents: read
     uses: ./.github/workflows/workflow-call-build-staged-images-push.yml
     with:
-      image_group: all
+      image_group: ${{ inputs.image_group }}
     secrets:
       ghcr_token: ${{ secrets.GITHUB_TOKEN }}
 
   publish_manifests:
     name: Publish multi-arch manifests
     needs: build_staged_images_push
-    if: github.event_name == 'push'
+    if: github.event_name == 'workflow_dispatch' && inputs.image_group == 'all'
     permissions:
       packages: write
       contents: read
