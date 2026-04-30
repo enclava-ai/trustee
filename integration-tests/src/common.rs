@@ -239,6 +239,7 @@ impl TestHarness {
                 worker_count: Some(4),
             },
             admin: admin_config,
+            policy_engine: Default::default(),
             storage_backend: StorageBackendConfig {
                 storage_type: KeyValueStorageType::LocalFs,
                 backends: KeyValueStorageStructConfig {
