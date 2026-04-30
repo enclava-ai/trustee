@@ -69,6 +69,13 @@ pub struct PolicyEngineConfig {
     /// Hex or base64 encoded Ed25519 public key used to verify signed policy
     /// artifacts when `require_signed_policy` is true.
     pub signed_policy_public_key: Option<String>,
+
+    /// Optional explicit allowlist of descriptor-signing public keys that may
+    /// sign policy artifacts directly.
+    ///
+    /// Do not populate this from CAP or from the artifact itself. It is an
+    /// independent Trustee trust anchor for customer/CI-signed artifacts.
+    pub trusted_descriptor_public_keys: Vec<String>,
 }
 
 /// Contains all configurable KBS properties.
@@ -200,6 +207,7 @@ mod tests {
             policy_path: Some("/opt/confidential-containers/opa/policy.rego".into()),
             require_signed_policy: false,
             signed_policy_public_key: None,
+            trusted_descriptor_public_keys: Vec::new(),
         },
         storage_backend: StorageBackendConfig {
             storage_type: KeyValueStorageType::LocalJson,
@@ -250,6 +258,7 @@ mod tests {
             policy_path: Some("/opt/confidential-containers/opa/policy.rego".into()),
             require_signed_policy: false,
             signed_policy_public_key: None,
+            trusted_descriptor_public_keys: Vec::new(),
         },
         storage_backend: StorageBackendConfig::default(),
         plugins: vec![PluginsConfig::ResourceStorage(RepositoryConfig::LocalFs {

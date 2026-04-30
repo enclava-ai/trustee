@@ -19,7 +19,13 @@ pub(crate) struct SignedPolicyArtifact {
     pub rego_text: String,
     #[serde(default)]
     pub rego_sha256: Option<String>,
+    #[serde(default)]
+    pub agent_policy_text: Option<String>,
+    #[serde(default)]
+    pub agent_policy_sha256: Option<String>,
     pub signature: String,
+    #[serde(default)]
+    pub verify_pubkey_b64: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -31,6 +37,10 @@ pub(crate) struct PolicyMetadata {
     pub platform_release_version: String,
     pub policy_template_id: String,
     pub policy_template_sha256: String,
+    #[serde(default)]
+    pub agent_policy_sha256: Option<String>,
+    #[serde(default)]
+    pub genpolicy_version_pin: Option<String>,
     pub signed_at: String,
     pub key_id: String,
 }
@@ -40,11 +50,18 @@ pub(crate) fn validate_config(config: &PolicyEngineConfig) -> Result<()> {
         return Ok(());
     }
 
-    let public_key = config
-        .signed_policy_public_key
-        .as_deref()
-        .ok_or_else(|| anyhow!("signed_policy_public_key is required"))?;
-    let _ = parse_verifying_key(public_key).context("parse signed_policy_public_key")?;
+    if config.signed_policy_public_key.is_none() && config.trusted_descriptor_public_keys.is_empty()
+    {
+        bail!(
+            "signed_policy_public_key or trusted_descriptor_public_keys is required when require_signed_policy is true"
+        );
+    }
+    if let Some(public_key) = config.signed_policy_public_key.as_deref() {
+        let _ = parse_verifying_key(public_key).context("parse signed_policy_public_key")?;
+    }
+    for public_key in &config.trusted_descriptor_public_keys {
+        let _ = parse_verifying_key(public_key).context("parse trusted_descriptor_public_keys")?;
+    }
 
     Ok(())
 }
@@ -72,30 +89,47 @@ pub(crate) fn verify(
     config: &PolicyEngineConfig,
     policy_body: &str,
 ) -> Result<SignedPolicyArtifact> {
-    let public_key = config
-        .signed_policy_public_key
-        .as_deref()
-        .ok_or_else(|| anyhow!("signed_policy_public_key is required"))?;
-    verify_with_public_key(policy_body, public_key)
-}
-
-fn verify_with_public_key(policy_body: &str, public_key: &str) -> Result<SignedPolicyArtifact> {
     let artifact: SignedPolicyArtifact =
         serde_json::from_str(policy_body).context("parse signed policy artifact")?;
-    let key = parse_verifying_key(public_key)?;
     let message = policy_artifact_message(&artifact)?;
     let signature = decode_fixed::<64>(&artifact.signature).context("decode policy signature")?;
     let signature = Signature::from_bytes(&signature);
 
-    key.verify(&message, &signature)
-        .context("verify policy artifact signature")?;
+    if let Some(public_key) = config.signed_policy_public_key.as_deref() {
+        let key = parse_verifying_key(public_key)?;
+        if key.verify(&message, &signature).is_ok() {
+            return Ok(artifact);
+        }
+    }
 
-    Ok(artifact)
+    if config
+        .trusted_descriptor_public_keys
+        .iter()
+        .any(|trusted| same_public_key(trusted, &artifact.metadata.descriptor_signing_pubkey))
+    {
+        let descriptor_key = parse_verifying_key(&artifact.metadata.descriptor_signing_pubkey)
+            .context("parse descriptor_signing_pubkey")?;
+        if descriptor_key.verify(&message, &signature).is_ok() {
+            return Ok(artifact);
+        }
+    }
+
+    bail!("verify policy artifact signature with configured trust anchors")
 }
 
 fn parse_verifying_key(public_key: &str) -> Result<VerifyingKey> {
     let key = decode_fixed::<32>(public_key).context("decode Ed25519 public key")?;
     VerifyingKey::from_bytes(&key).context("parse Ed25519 public key")
+}
+
+fn same_public_key(left: &str, right: &str) -> bool {
+    let Ok(left) = decode_fixed::<32>(left) else {
+        return false;
+    };
+    let Ok(right) = decode_fixed::<32>(right) else {
+        return false;
+    };
+    left == right
 }
 
 fn decode_fixed<const N: usize>(input: &str) -> Result<[u8; N]> {
@@ -147,6 +181,18 @@ fn policy_artifact_message(artifact: &SignedPolicyArtifact) -> Result<Vec<u8>> {
             bail!("rego_sha256 does not match rego_text");
         }
     }
+    if let Some(agent_policy_text) = artifact.agent_policy_text.as_deref() {
+        let actual: [u8; 32] = Sha256::digest(agent_policy_text.as_bytes()).into();
+        let expected = artifact
+            .agent_policy_sha256
+            .as_deref()
+            .or(artifact.metadata.agent_policy_sha256.as_deref())
+            .ok_or_else(|| anyhow!("agent_policy_sha256 missing"))?;
+        let expected = decode_fixed::<32>(expected).context("decode agent_policy_sha256")?;
+        if expected != actual {
+            bail!("agent_policy_sha256 does not match agent_policy_text");
+        }
+    }
 
     Ok(ce_v1_bytes(&[
         ("purpose", b"enclava-policy-artifact-v1"),
@@ -168,22 +214,36 @@ fn canonical_policy_metadata_hash(metadata: &PolicyMetadata) -> Result<[u8; 32]>
         .context("decode descriptor_signing_pubkey")?;
     let policy_template_sha256 = decode_fixed::<32>(&metadata.policy_template_sha256)
         .context("decode policy_template_sha256")?;
+    let agent_policy_sha256 = metadata
+        .agent_policy_sha256
+        .as_deref()
+        .map(|value| decode_fixed::<32>(value).context("decode agent_policy_sha256"))
+        .transpose()?;
+    let genpolicy_version_pin = metadata.genpolicy_version_pin.as_deref().unwrap_or("");
 
-    Ok(Sha256::digest(ce_v1_bytes(&[
-        ("app_id", &app_id),
-        ("deploy_id", &deploy_id),
-        ("descriptor_core_hash", &descriptor_core_hash),
-        ("descriptor_signing_pubkey", &descriptor_signing_pubkey),
+    let mut records: Vec<(&str, &[u8])> = vec![
+        ("app_id", app_id.as_slice()),
+        ("deploy_id", deploy_id.as_slice()),
+        ("descriptor_core_hash", descriptor_core_hash.as_slice()),
+        (
+            "descriptor_signing_pubkey",
+            descriptor_signing_pubkey.as_slice(),
+        ),
         (
             "platform_release_version",
             metadata.platform_release_version.as_bytes(),
         ),
         ("policy_template_id", metadata.policy_template_id.as_bytes()),
-        ("policy_template_sha256", &policy_template_sha256),
-        ("signed_at", metadata.signed_at.as_bytes()),
-        ("key_id", metadata.key_id.as_bytes()),
-    ]))
-    .into())
+        ("policy_template_sha256", policy_template_sha256.as_slice()),
+    ];
+    if let Some(agent_policy_sha256) = agent_policy_sha256.as_ref() {
+        records.push(("agent_policy_sha256", agent_policy_sha256.as_slice()));
+        records.push(("genpolicy_version_pin", genpolicy_version_pin.as_bytes()));
+    }
+    records.push(("signed_at", metadata.signed_at.as_bytes()));
+    records.push(("key_id", metadata.key_id.as_bytes()));
+
+    Ok(Sha256::digest(ce_v1_bytes(&records)).into())
 }
 
 pub(crate) fn decode_ce_v1_records(input: &[u8]) -> Result<Vec<(String, Vec<u8>)>> {
@@ -235,13 +295,15 @@ mod tests {
 
     fn metadata_for(rego: &str) -> PolicyMetadata {
         PolicyMetadata {
-            app_id: "app".into(),
-            deploy_id: "deploy".into(),
+            app_id: "11111111-1111-1111-1111-111111111111".into(),
+            deploy_id: "22222222-2222-2222-2222-222222222222".into(),
             descriptor_core_hash: "00".repeat(32),
             descriptor_signing_pubkey: "11".repeat(32),
             platform_release_version: "test".into(),
             policy_template_id: "resource-policy".into(),
             policy_template_sha256: hex::encode(Sha256::digest(rego.as_bytes())),
+            agent_policy_sha256: None,
+            genpolicy_version_pin: None,
             signed_at: "2026-04-28T00:00:00Z".into(),
             key_id: "test-key".into(),
         }
@@ -251,8 +313,20 @@ mod tests {
         let mut artifact = SignedPolicyArtifact {
             metadata: metadata_for(rego),
             rego_text: rego.to_string(),
+            rego_sha256: None,
+            agent_policy_text: None,
+            agent_policy_sha256: None,
             signature: String::new(),
+            verify_pubkey_b64: None,
         };
+        let message = policy_artifact_message(&artifact).unwrap();
+        artifact.signature = hex::encode(sk.sign(&message).to_bytes());
+        artifact
+    }
+
+    fn descriptor_signed_policy(sk: &SigningKey, rego: &str) -> SignedPolicyArtifact {
+        let mut artifact = signed_policy(sk, rego);
+        artifact.metadata.descriptor_signing_pubkey = hex::encode(sk.verifying_key().to_bytes());
         let message = policy_artifact_message(&artifact).unwrap();
         artifact.signature = hex::encode(sk.sign(&message).to_bytes());
         artifact
@@ -262,6 +336,7 @@ mod tests {
         PolicyEngineConfig {
             require_signed_policy: true,
             signed_policy_public_key: Some(hex::encode(pk.to_bytes())),
+            trusted_descriptor_public_keys: Vec::new(),
             ..Default::default()
         }
     }
@@ -276,6 +351,38 @@ mod tests {
         let rego = rego_for_evaluation(&config, &body).unwrap();
 
         assert_eq!(rego, TEST_REGO);
+    }
+
+    #[test]
+    fn descriptor_signed_policy_unwraps_without_platform_key() {
+        let sk = SigningKey::from_bytes(&[9u8; 32]);
+        let artifact = descriptor_signed_policy(&sk, TEST_REGO);
+        let body = serde_json::to_string(&artifact).unwrap();
+        let config = PolicyEngineConfig {
+            require_signed_policy: true,
+            signed_policy_public_key: None,
+            trusted_descriptor_public_keys: vec![hex::encode(sk.verifying_key().to_bytes())],
+            ..Default::default()
+        };
+
+        let rego = rego_for_evaluation(&config, &body).unwrap();
+
+        assert_eq!(rego, TEST_REGO);
+    }
+
+    #[test]
+    fn descriptor_signed_policy_is_rejected_without_independent_trust_anchor() {
+        let sk = SigningKey::from_bytes(&[9u8; 32]);
+        let artifact = descriptor_signed_policy(&sk, TEST_REGO);
+        let body = serde_json::to_string(&artifact).unwrap();
+        let config = PolicyEngineConfig {
+            require_signed_policy: true,
+            signed_policy_public_key: None,
+            trusted_descriptor_public_keys: Vec::new(),
+            ..Default::default()
+        };
+
+        assert!(rego_for_evaluation(&config, &body).is_err());
     }
 
     #[test]
