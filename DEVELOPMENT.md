@@ -45,3 +45,32 @@ devcontainer build --workspace-folder --docker-path podman --config .devcontaine
 #### Dependabot
 
 Development container specifications have beend added to the dependabot eco system, more information [here](https://containers.dev/guide/dependabot).
+
+## Local Fedora KBS all-verifier build
+
+The default KBS feature set enables the built-in CoCo Attestation Service with
+`all-verifier`. On Fedora, local builds and tests for that profile need the
+protobuf compiler plus TPM, Intel SGX/DCAP, and Clang bindgen headers:
+
+```shell
+sudo dnf install -y \
+  protobuf-compiler \
+  tpm2-tss-devel \
+  sgx-common sgx-libs sgx-devel \
+  clang20 clang20-devel
+```
+
+After those packages are installed, plain Cargo commands should work without
+`PROTOC`, `PKG_CONFIG_PATH`, or `BINDGEN_EXTRA_CLANG_ARGS` overrides:
+
+```shell
+cargo test -p kbs policy_artifact -- --nocapture
+cargo test -p kbs read_config -- --nocapture
+```
+
+For AMD SEV-SNP-only development where the broad verifier set is not needed,
+use the lean built-in AS profile instead:
+
+```shell
+cargo build -p kbs --no-default-features --features coco-as-builtin-snp
+```

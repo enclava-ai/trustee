@@ -147,7 +147,11 @@ impl AttestationService {
         _storage_backend_config: &StorageBackendConfig,
     ) -> Result<Self> {
         let inner = match config.attestation_service {
-            #[cfg(any(feature = "coco-as-builtin", feature = "coco-as-builtin-no-verifier"))]
+            #[cfg(any(
+                feature = "coco-as-builtin",
+                feature = "coco-as-builtin-snp",
+                feature = "coco-as-builtin-no-verifier"
+            ))]
             AttestationServiceConfig::CoCoASBuiltIn(cfg) => {
                 let built_in_as =
                     super::coco::builtin::BuiltInCoCoAs::new(cfg, _storage_backend_config)

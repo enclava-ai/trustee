@@ -79,7 +79,7 @@ Due to different `type` field, properties are different.
 When `type` is set to `coco_as_builtin`, the following properties can be set.
 
 > Built-In CoCo AS is available only when one or more of the following features are enabled:
-> `coco-as-builtin`, `coco-as-builtin-no-verifier`
+> `coco-as-builtin`, `coco-as-builtin-snp`, `coco-as-builtin-no-verifier`
 
 | Property                   | Type                        | Description                                              | Default                                                                                                       |
 |----------------------------|-----------------------------|----------------------------------------------------------|---------------------------------------------------------------------------------------------------------------|
@@ -242,6 +242,24 @@ For detailed configuration options and examples, see the [Key-Value Storage READ
 
 > [!NOTE]
 > All persistent storage is configured via `[storage_backend]`. If `[storage_backend]` is omitted, the default in-memory storage is used (data is not persisted across restarts).
+
+### Policy Engine Configuration
+
+The following properties can be set under the `[policy_engine]` section.
+
+| Property | Type | Description | Required | Default |
+|----------|------|-------------|----------|---------|
+| `require_signed_policy` | Boolean | Require resource policies to be stored as signed policy artifacts instead of raw Rego. | No | `false` |
+| `signed_policy_public_key` | String | Hex or base64 Ed25519 public key that verifies platform-signed policy artifacts. This is a compatibility trust anchor; leave unset for customer-authoritative deployments. | No | None |
+| `trusted_org_owner_public_keys` | String array | Hex or base64 Ed25519 org owner public keys. KBS accepts customer-signed policy artifacts only when the artifact is signed by a descriptor key authorized by an owner-signed org keyring rooted in one of these keys. | No | Empty |
+| `trusted_descriptor_public_keys` | String array | Hex or base64 descriptor-signing public keys allowed to sign policy artifacts directly. Do not populate this from CAP or from artifact metadata; it must be an independent KBS trust anchor. | No | Empty |
+
+When `require_signed_policy = true`, at least one of
+`signed_policy_public_key`, `trusted_org_owner_public_keys`, or
+`trusted_descriptor_public_keys` must be configured. Customer-authoritative
+deployments should prefer `trusted_org_owner_public_keys` and
+`REQUIRE_CUSTOMER_SIGNED_POLICY_ARTIFACT=true` on CAP so CAP only transports
+the customer artifact and KBS verifies the customer/org trust chain.
 
 ### Plugins Configuration
 

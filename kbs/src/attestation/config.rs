@@ -34,7 +34,11 @@ fn default_timeout() -> i64 {
 /// FIXME: add a proper fix to Box the AttestationServiceConfig enum
 #[allow(clippy::large_enum_variant)]
 pub enum AttestationServiceConfig {
-    #[cfg(any(feature = "coco-as-builtin", feature = "coco-as-builtin-no-verifier"))]
+    #[cfg(any(
+        feature = "coco-as-builtin",
+        feature = "coco-as-builtin-snp",
+        feature = "coco-as-builtin-no-verifier"
+    ))]
     #[serde(alias = "coco_as_builtin")]
     CoCoASBuiltIn(super::coco::builtin::Config),
 
@@ -50,7 +54,11 @@ pub enum AttestationServiceConfig {
 impl Default for AttestationServiceConfig {
     fn default() -> Self {
         cfg_if::cfg_if! {
-            if #[cfg(any(feature = "coco-as-builtin", feature = "coco-as-builtin-no-verifier"))] {
+            if #[cfg(any(
+                feature = "coco-as-builtin",
+                feature = "coco-as-builtin-snp",
+                feature = "coco-as-builtin-no-verifier"
+            ))] {
                 AttestationServiceConfig::CoCoASBuiltIn(super::coco::builtin::Config::default())
             } else if #[cfg(feature = "coco-as-grpc")] {
                 AttestationServiceConfig::CoCoASGrpc(super::coco::grpc::GrpcConfig::default())

@@ -70,6 +70,10 @@ pub struct PolicyEngineConfig {
     /// artifacts when `require_signed_policy` is true.
     pub signed_policy_public_key: Option<String>,
 
+    /// Optional explicit allowlist of customer/org owner public keys that may
+    /// authorize signed policy artifacts through an owner-signed org keyring.
+    pub trusted_org_owner_public_keys: Vec<String>,
+
     /// Optional explicit allowlist of descriptor-signing public keys that may
     /// sign policy artifacts directly.
     ///
@@ -160,10 +164,12 @@ mod tests {
 
     use super::KbsConfig;
 
+    #[cfg(any(feature = "coco-as-builtin", feature = "coco-as-builtin-snp"))]
+    use attestation_service::{ear_token::EarTokenConfiguration, rvps::RvpsConfig};
     #[cfg(feature = "coco-as-builtin")]
     use attestation_service::{
-        ear_token::{EarTokenConfiguration, COCO_AS_ISSUER_NAME, DEFAULT_TOKEN_DURATION},
-        rvps::{grpc::RvpsRemoteConfig, RvpsConfig},
+        ear_token::{COCO_AS_ISSUER_NAME, DEFAULT_TOKEN_DURATION},
+        rvps::grpc::RvpsRemoteConfig,
     };
 
     use key_value_storage::{
@@ -191,6 +197,8 @@ mod tests {
                 ),
             timeout: 600,
         },
+        #[cfg(all(feature = "as", not(feature = "coco-as-grpc")))]
+        attestation_service: Default::default(),
         http_server: HttpServerConfig {
             sockets: vec!["0.0.0.0:8080".parse().unwrap()],
             private_key: Some("/etc/kbs-private.key".into()),
@@ -207,6 +215,7 @@ mod tests {
             policy_path: Some("/opt/confidential-containers/opa/policy.rego".into()),
             require_signed_policy: false,
             signed_policy_public_key: None,
+            trusted_org_owner_public_keys: Vec::new(),
             trusted_descriptor_public_keys: Vec::new(),
         },
         storage_backend: StorageBackendConfig {
@@ -242,6 +251,8 @@ mod tests {
                 ),
             timeout: crate::attestation::config::DEFAULT_TIMEOUT,
         },
+        #[cfg(all(feature = "as", not(feature = "coco-as-grpc")))]
+        attestation_service: Default::default(),
         http_server: HttpServerConfig {
             sockets: vec!["0.0.0.0:8080".parse().unwrap()],
             private_key: None,
@@ -258,6 +269,7 @@ mod tests {
             policy_path: Some("/opt/confidential-containers/opa/policy.rego".into()),
             require_signed_policy: false,
             signed_policy_public_key: None,
+            trusted_org_owner_public_keys: Vec::new(),
             trusted_descriptor_public_keys: Vec::new(),
         },
         storage_backend: StorageBackendConfig::default(),
@@ -291,6 +303,8 @@ mod tests {
                 ),
             timeout: crate::attestation::config::DEFAULT_TIMEOUT,
         },
+        #[cfg(all(feature = "as", not(feature = "coco-as-builtin")))]
+        attestation_service: Default::default(),
         http_server: HttpServerConfig {
             sockets: vec![DEFAULT_SOCKET.parse().unwrap()],
             private_key: None,
@@ -337,6 +351,8 @@ mod tests {
                 ),
             timeout: crate::attestation::config::DEFAULT_TIMEOUT,
         },
+        #[cfg(all(feature = "as", not(feature = "intel-trust-authority-as")))]
+        attestation_service: Default::default(),
         http_server: HttpServerConfig {
             sockets: vec!["0.0.0.0:8080".parse().unwrap()],
             private_key: Some("/etc/kbs-private.key".into()),
@@ -380,6 +396,8 @@ mod tests {
                 ),
             timeout: crate::attestation::config::DEFAULT_TIMEOUT,
         },
+        #[cfg(all(feature = "as", not(feature = "coco-as-grpc")))]
+        attestation_service: Default::default(),
         http_server: HttpServerConfig {
             sockets: vec!["0.0.0.0:8080".parse().unwrap()],
             private_key: None,
@@ -417,7 +435,7 @@ mod tests {
             trusted_jwk_sets: vec![],
             extra_teekey_paths: vec![],
         },
-        #[cfg(feature = "coco-as-builtin")]
+        #[cfg(any(feature = "coco-as-builtin", feature = "coco-as-builtin-snp"))]
         attestation_service: crate::attestation::config::AttestationConfig {
             attestation_service:
                 crate::attestation::config::AttestationServiceConfig::CoCoASBuiltIn(
@@ -432,6 +450,11 @@ mod tests {
                 ),
             timeout: crate::attestation::config::DEFAULT_TIMEOUT,
         },
+        #[cfg(all(
+            feature = "as",
+            not(any(feature = "coco-as-builtin", feature = "coco-as-builtin-snp"))
+        ))]
+        attestation_service: Default::default(),
         http_server: HttpServerConfig {
             sockets: vec!["0.0.0.0:8080".parse().unwrap()],
             private_key: None,
@@ -476,6 +499,8 @@ mod tests {
                 ),
             timeout: crate::attestation::config::DEFAULT_TIMEOUT,
         },
+        #[cfg(all(feature = "as", not(feature = "intel-trust-authority-as")))]
+        attestation_service: Default::default(),
         http_server: HttpServerConfig {
             sockets: vec!["0.0.0.0:8080".parse().unwrap()],
             private_key: None,
@@ -507,6 +532,8 @@ mod tests {
                 ),
             timeout: crate::attestation::config::DEFAULT_TIMEOUT,
         },
+        #[cfg(all(feature = "as", not(feature = "coco-as-grpc")))]
+        attestation_service: Default::default(),
         http_server: HttpServerConfig {
             insecure_http: true,
             ..Default::default()
@@ -540,6 +567,8 @@ mod tests {
                 ),
             timeout: crate::attestation::config::DEFAULT_TIMEOUT,
         },
+        #[cfg(all(feature = "as", not(feature = "intel-trust-authority-as")))]
+        attestation_service: Default::default(),
         http_server: HttpServerConfig {
             insecure_http: true,
             ..Default::default()
@@ -559,7 +588,7 @@ mod tests {
             trusted_jwk_sets: vec![],
             extra_teekey_paths: vec![],
         },
-        #[cfg(feature = "coco-as-builtin")]
+        #[cfg(any(feature = "coco-as-builtin", feature = "coco-as-builtin-snp"))]
         attestation_service: crate::attestation::config::AttestationConfig {
             attestation_service:
                 crate::attestation::config::AttestationServiceConfig::CoCoASBuiltIn(
@@ -574,6 +603,11 @@ mod tests {
                 ),
             timeout: crate::attestation::config::DEFAULT_TIMEOUT,
         },
+        #[cfg(all(
+            feature = "as",
+            not(any(feature = "coco-as-builtin", feature = "coco-as-builtin-snp"))
+        ))]
+        attestation_service: Default::default(),
         http_server: HttpServerConfig {
             insecure_http: true,
             ..Default::default()
@@ -600,6 +634,23 @@ mod tests {
         ],
     })]
     fn read_config(#[case] config_path: &str, #[case] expected: KbsConfig) {
+        // Some fixtures exercise backends that are intentionally absent in
+        // narrow feature builds such as `coco-as-builtin-snp`.
+        if config_path.contains("coco-as-grpc") && !cfg!(feature = "coco-as-grpc") {
+            return;
+        }
+        if config_path.contains("intel-ta") && !cfg!(feature = "intel-trust-authority-as") {
+            return;
+        }
+        if config_path.contains("coco-as-builtin-1") && !cfg!(feature = "coco-as-builtin") {
+            return;
+        }
+        if config_path.contains("coco-as-builtin")
+            && !(cfg!(feature = "coco-as-builtin") || cfg!(feature = "coco-as-builtin-snp"))
+        {
+            return;
+        }
+
         let config = KbsConfig::try_from(Path::new(config_path)).unwrap();
         assert_eq!(config, expected, "case {config_path}");
     }

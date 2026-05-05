@@ -111,17 +111,29 @@ impl ApiServer {
         anyhow::bail!("unsupported Authorization scheme {scheme}");
     }
 
-    async fn verified_resource_policy_rego(&self) -> Result<String> {
+    async fn verified_resource_policy_rego(&self, claim_str: &str) -> Result<String> {
         let stored_policy = self.policy_engine.get_policy(KBS_POLICY_ID).await?;
-        policy_artifact::rego_for_evaluation(&self.config.policy_engine, &stored_policy)
-            .map_err(|source| Error::ParsePolicyError { source })
+        policy_artifact::rego_for_evaluation(
+            &self.config.policy_engine,
+            &stored_policy,
+            Some(claim_str),
+        )
+        .map_err(|source| Error::ParsePolicyError { source })
     }
 
-    async fn verified_resource_policy_body(&self, policy_id: &str) -> Result<String> {
+    async fn verified_resource_policy_body(
+        &self,
+        policy_id: &str,
+        claim_str: &str,
+    ) -> Result<String> {
         let stored_policy = self.policy_engine.get_policy(policy_id).await?;
         if self.config.policy_engine.require_signed_policy {
-            let _ = policy_artifact::verify(&self.config.policy_engine, &stored_policy)
-                .map_err(|source| Error::ParsePolicyError { source })?;
+            return Ok(policy_artifact::policy_body_for_claims(
+                &self.config.policy_engine,
+                &stored_policy,
+                Some(claim_str),
+            )
+            .map_err(|source| Error::ParsePolicyError { source })?);
         }
 
         Ok(stored_policy)
@@ -132,7 +144,7 @@ impl ApiServer {
         policy_data: Option<&str>,
         claim_str: &str,
     ) -> Result<policy_engine::EvaluationResult> {
-        let policy = self.verified_resource_policy_rego().await?;
+        let policy = self.verified_resource_policy_rego(claim_str).await?;
         self.policy_engine
             .engine
             .evaluate(
@@ -437,7 +449,9 @@ pub(crate) async fn api(
             }
             KBS_POLICY_APPROVALS.inc();
 
-            let policy = core.verified_resource_policy_body(policy_id).await?;
+            let policy = core
+                .verified_resource_policy_body(policy_id, &claim_str)
+                .await?;
             Ok(HttpResponse::Ok()
                 .content_type("application/json")
                 .body(policy))
@@ -1279,7 +1293,7 @@ mod workload_resource_tests {
             .unwrap();
 
         let stored = policy_engine.get_policy(KBS_POLICY_ID).await.unwrap();
-        let err = policy_artifact::rego_for_evaluation(&config, &stored).unwrap_err();
+        let err = policy_artifact::rego_for_evaluation(&config, &stored, None).unwrap_err();
 
         assert!(
             err.to_string().contains("parse signed policy artifact"),
