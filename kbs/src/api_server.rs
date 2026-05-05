@@ -128,12 +128,12 @@ impl ApiServer {
     ) -> Result<String> {
         let stored_policy = self.policy_engine.get_policy(policy_id).await?;
         if self.config.policy_engine.require_signed_policy {
-            return Ok(policy_artifact::policy_body_for_claims(
+            return policy_artifact::policy_body_for_claims(
                 &self.config.policy_engine,
                 &stored_policy,
                 Some(claim_str),
             )
-            .map_err(|source| Error::ParsePolicyError { source })?);
+            .map_err(|source| Error::ParsePolicyError { source });
         }
 
         Ok(stored_policy)
