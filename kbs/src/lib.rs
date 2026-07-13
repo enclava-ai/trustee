@@ -20,6 +20,7 @@ pub mod plugins;
 pub use error::*;
 
 pub mod admin;
+mod deployment_authorization;
 pub mod http;
 pub mod jwe;
 pub(crate) mod policy_artifact;

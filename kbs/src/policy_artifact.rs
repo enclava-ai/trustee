@@ -15,6 +15,20 @@ use uuid::Uuid;
 
 use crate::config::PolicyEngineConfig;
 
+const STATIC_POLICY_SCHEMA_V1: &str = "enclava-kbs-static-resource-policy-v1";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct StaticSignedPolicy {
+    schema_version: String,
+    policy_epoch: u64,
+    rego_text: String,
+    rego_sha256: String,
+    issuer_key_id: String,
+    signature_alg: String,
+    signature: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct SignedPolicyArtifact {
     pub metadata: PolicyMetadata,
@@ -91,6 +105,9 @@ pub(crate) enum KeyringRole {
 }
 
 pub(crate) fn validate_config(config: &PolicyEngineConfig) -> Result<()> {
+    if config.require_deployment_authorization && !config.require_signed_policy {
+        bail!("receipt mode requires signed static policy enforcement");
+    }
     if !config.require_signed_policy {
         return Ok(());
     }
@@ -105,6 +122,20 @@ pub(crate) fn validate_config(config: &PolicyEngineConfig) -> Result<()> {
     }
     if let Some(public_key) = config.signed_policy_public_key.as_deref() {
         let _ = parse_verifying_key(public_key).context("parse signed_policy_public_key")?;
+    }
+    if config.require_deployment_authorization {
+        let digest = config
+            .static_resource_policy_sha256
+            .as_deref()
+            .context("static_resource_policy_sha256 is required in receipt mode")?;
+        let _ = decode_fixed::<32>(digest).context("decode static_resource_policy_sha256")?;
+        if config
+            .static_policy_issuer_key_id
+            .as_deref()
+            .is_none_or(str::is_empty)
+        {
+            bail!("static_policy_issuer_key_id is required in receipt mode");
+        }
     }
     for public_key in &config.trusted_org_owner_public_keys {
         let _ = parse_verifying_key(public_key).context("parse trusted_org_owner_public_keys")?;
@@ -122,6 +153,12 @@ pub(crate) fn rego_for_evaluation(
     claim_str: Option<&str>,
 ) -> Result<String> {
     if config.require_signed_policy {
+        if let Ok(policy) = verify_static_policy(config, stored_policy) {
+            return Ok(policy.rego_text);
+        }
+        if config.require_deployment_authorization {
+            bail!("receipt mode requires one static signed resource policy");
+        }
         return select_verified_artifact(config, stored_policy, claim_str)
             .map(|artifact| artifact.rego_text);
     }
@@ -135,6 +172,12 @@ pub(crate) fn policy_body_for_claims(
     claim_str: Option<&str>,
 ) -> Result<String> {
     if config.require_signed_policy {
+        if let Ok(policy) = verify_static_policy(config, stored_policy) {
+            return Ok(serde_json::to_string(&policy)?);
+        }
+        if config.require_deployment_authorization {
+            bail!("receipt mode requires one static signed resource policy");
+        }
         let artifact = select_verified_artifact(config, stored_policy, claim_str)?;
         return Ok(serde_json::to_string(&artifact)?);
     }
@@ -150,6 +193,33 @@ pub(crate) fn policy_for_storage(config: &PolicyEngineConfig, policy_body: &str)
     Ok(policy_body.to_string())
 }
 
+pub(crate) fn validate_static_policy_transition(
+    config: &PolicyEngineConfig,
+    existing: Option<&str>,
+    replacement: &str,
+) -> Result<()> {
+    let replacement = match verify_static_policy(config, replacement) {
+        Ok(policy) => policy,
+        Err(error) if config.require_deployment_authorization => return Err(error),
+        Err(_) => return Ok(()),
+    };
+    let Some(existing) = existing else {
+        return Ok(());
+    };
+    let Ok(existing) = verify_static_policy(config, existing) else {
+        return Ok(());
+    };
+    if replacement.policy_epoch < existing.policy_epoch {
+        bail!("static policy epoch rollback rejected");
+    }
+    if replacement.policy_epoch == existing.policy_epoch
+        && replacement.rego_sha256 != existing.rego_sha256
+    {
+        bail!("different static policy bytes at accepted epoch rejected");
+    }
+    Ok(())
+}
+
 pub(crate) fn verify(
     config: &PolicyEngineConfig,
     policy_body: &str,
@@ -160,6 +230,12 @@ pub(crate) fn verify(
 }
 
 fn verify_policy_body(config: &PolicyEngineConfig, policy_body: &str) -> Result<()> {
+    if verify_static_policy(config, policy_body).is_ok() {
+        return Ok(());
+    }
+    if config.require_deployment_authorization {
+        bail!("receipt mode rejects dynamic signed policy artifacts");
+    }
     if let Ok(set) = serde_json::from_str::<SignedPolicyArtifactSet>(policy_body) {
         if set.artifacts.is_empty() {
             bail!("signed policy artifact set is empty");
@@ -172,6 +248,61 @@ fn verify_policy_body(config: &PolicyEngineConfig, policy_body: &str) -> Result<
 
     let _ = verify(config, policy_body)?;
     Ok(())
+}
+
+fn verify_static_policy(
+    config: &PolicyEngineConfig,
+    policy_body: &str,
+) -> Result<StaticSignedPolicy> {
+    let policy: StaticSignedPolicy =
+        serde_json::from_str(policy_body).context("parse static signed resource policy")?;
+    if policy.schema_version != STATIC_POLICY_SCHEMA_V1
+        || policy.policy_epoch == 0
+        || policy.signature_alg != "ed25519"
+        || policy.issuer_key_id.is_empty()
+    {
+        bail!("static signed resource policy contract is invalid");
+    }
+    if config.require_deployment_authorization {
+        let expected_digest = config
+            .static_resource_policy_sha256
+            .as_deref()
+            .context("static_resource_policy_sha256 is required in receipt mode")?;
+        let expected_digest =
+            decode_fixed::<32>(expected_digest).context("decode static policy release digest")?;
+        let actual_digest: [u8; 32] = Sha256::digest(policy_body.as_bytes()).into();
+        if actual_digest != expected_digest {
+            bail!("static resource policy release digest mismatch");
+        }
+        if config.static_policy_issuer_key_id.as_deref() != Some(policy.issuer_key_id.as_str()) {
+            bail!("static resource policy issuer key id mismatch");
+        }
+    }
+    let declared_hash =
+        decode_fixed::<32>(&policy.rego_sha256).context("decode static policy rego_sha256")?;
+    let actual_hash: [u8; 32] = Sha256::digest(policy.rego_text.as_bytes()).into();
+    if declared_hash != actual_hash {
+        bail!("static policy rego_sha256 does not match rego_text");
+    }
+    let configured_key = config
+        .signed_policy_public_key
+        .as_deref()
+        .context("signed_policy_public_key is required for static policy")?;
+    let key = parse_verifying_key(configured_key)?;
+    let signature =
+        decode_fixed::<64>(&policy.signature).context("decode static policy signature")?;
+    let epoch = policy.policy_epoch.to_be_bytes();
+    let message = ce_v1_bytes(&[
+        ("purpose", STATIC_POLICY_SCHEMA_V1.as_bytes()),
+        ("schema_version", policy.schema_version.as_bytes()),
+        ("policy_epoch", &epoch),
+        ("rego_sha256", &declared_hash),
+        ("issuer_key_id", policy.issuer_key_id.as_bytes()),
+        ("signature_alg", policy.signature_alg.as_bytes()),
+    ]);
+    key.verify(&message, &Signature::from_bytes(&signature))
+        .context("verify static resource policy signature")?;
+    Ok(policy)
 }
 
 fn select_verified_artifact(
@@ -631,6 +762,30 @@ mod tests {
         artifact
     }
 
+    fn static_policy(sk: &SigningKey, epoch: u64, rego: &str) -> String {
+        let rego_hash: [u8; 32] = Sha256::digest(rego.as_bytes()).into();
+        let epoch_bytes = epoch.to_be_bytes();
+        let mut policy = StaticSignedPolicy {
+            schema_version: STATIC_POLICY_SCHEMA_V1.into(),
+            policy_epoch: epoch,
+            rego_text: rego.into(),
+            rego_sha256: hex::encode(rego_hash),
+            issuer_key_id: "platform-policy-1".into(),
+            signature_alg: "ed25519".into(),
+            signature: String::new(),
+        };
+        let message = ce_v1_bytes(&[
+            ("purpose", STATIC_POLICY_SCHEMA_V1.as_bytes()),
+            ("schema_version", STATIC_POLICY_SCHEMA_V1.as_bytes()),
+            ("policy_epoch", &epoch_bytes),
+            ("rego_sha256", &rego_hash),
+            ("issuer_key_id", policy.issuer_key_id.as_bytes()),
+            ("signature_alg", policy.signature_alg.as_bytes()),
+        ]);
+        policy.signature = hex::encode(sk.sign(&message).to_bytes());
+        serde_json::to_string(&policy).unwrap()
+    }
+
     fn descriptor_signed_policy(sk: &SigningKey, rego: &str) -> SignedPolicyArtifact {
         let mut artifact = signed_policy(sk, rego);
         artifact.metadata.descriptor_signing_pubkey = hex::encode(sk.verifying_key().to_bytes());
@@ -658,6 +813,14 @@ mod tests {
             trusted_descriptor_public_keys: Vec::new(),
             ..Default::default()
         }
+    }
+
+    fn receipt_static_policy_config(pk: &VerifyingKey, body: &str) -> PolicyEngineConfig {
+        let mut config = signed_policy_config(pk);
+        config.require_deployment_authorization = true;
+        config.static_resource_policy_sha256 = Some(hex::encode(Sha256::digest(body.as_bytes())));
+        config.static_policy_issuer_key_id = Some("platform-policy-1".into());
+        config
     }
 
     fn fixed_time() -> DateTime<Utc> {
@@ -701,6 +864,20 @@ mod tests {
         let rego = rego_for_evaluation(&config, &body, None).unwrap();
 
         assert_eq!(rego, TEST_REGO);
+    }
+
+    #[test]
+    fn receipt_mode_rejects_legacy_dynamic_policy_artifacts() {
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        let artifact = signed_policy(&sk, TEST_REGO);
+        let body = serde_json::to_string(&artifact).unwrap();
+        let mut config = signed_policy_config(&sk.verifying_key());
+        config.require_deployment_authorization = true;
+
+        assert!(rego_for_evaluation(&config, &body, None).is_err());
+        assert!(policy_body_for_claims(&config, &body, None).is_err());
+        assert!(policy_for_storage(&config, &body).is_err());
+        assert!(validate_static_policy_transition(&config, None, &body).is_err());
     }
 
     #[test]
@@ -788,6 +965,49 @@ mod tests {
             err.to_string().contains("parse signed policy artifact"),
             "{err:?}"
         );
+    }
+
+    #[test]
+    fn static_signed_policy_verifies_and_rejects_epoch_rollback_or_reuse() {
+        let sk = SigningKey::from_bytes(&[0x42; 32]);
+        let config = signed_policy_config(&sk.verifying_key());
+        let epoch_one = static_policy(&sk, 1, TEST_REGO);
+        let epoch_two = static_policy(&sk, 2, "package policy\ndefault allow := false\n");
+        let conflicting_epoch_two = static_policy(&sk, 2, "package policy\nallow := true\n");
+
+        assert_eq!(
+            rego_for_evaluation(&config, &epoch_one, None).unwrap(),
+            TEST_REGO
+        );
+        validate_static_policy_transition(&config, Some(&epoch_one), &epoch_two).unwrap();
+        assert!(validate_static_policy_transition(&config, Some(&epoch_two), &epoch_one).is_err());
+        assert!(validate_static_policy_transition(
+            &config,
+            Some(&epoch_two),
+            &conflicting_epoch_two
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn receipt_mode_requires_exact_static_policy_release_pins() {
+        let sk = SigningKey::from_bytes(&[0x42; 32]);
+        let body = static_policy(&sk, 1, TEST_REGO);
+        let config = receipt_static_policy_config(&sk.verifying_key(), &body);
+
+        validate_config(&config).unwrap();
+        assert_eq!(
+            rego_for_evaluation(&config, &body, None).unwrap(),
+            TEST_REGO
+        );
+
+        let mut wrong_digest = config.clone();
+        wrong_digest.static_resource_policy_sha256 = Some("00".repeat(32));
+        assert!(rego_for_evaluation(&wrong_digest, &body, None).is_err());
+
+        let mut wrong_issuer = config;
+        wrong_issuer.static_policy_issuer_key_id = Some("other-policy-key".into());
+        assert!(rego_for_evaluation(&wrong_issuer, &body, None).is_err());
     }
 
     #[test]

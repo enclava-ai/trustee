@@ -6,7 +6,8 @@
 use std::sync::LazyLock;
 
 use prometheus::{
-    Counter, CounterVec, Gauge, Histogram, HistogramOpts, Opts, Registry, TextEncoder,
+    Counter, CounterVec, Gauge, GaugeVec, Histogram, HistogramOpts, IntGauge, Opts, Registry,
+    TextEncoder,
 };
 
 macro_rules! make_counter {
@@ -120,6 +121,61 @@ pub(crate) static KBS_POLICY_ERRORS: LazyLock<Counter> = LazyLock::new(|| {
     )
 });
 
+pub(crate) static DEPLOYMENT_AUTHORIZATION_LOOKUPS_TOTAL: LazyLock<CounterVec> =
+    LazyLock::new(|| {
+        make_counter_vec!(
+            "kbs_deployment_authorization_lookup_total",
+            "Deployment authorization lookup and verification outcomes",
+            ["result"]
+        )
+    });
+
+pub(crate) static DEPLOYMENT_AUTHORIZATION_LOOKUP_SECONDS: LazyLock<Histogram> =
+    LazyLock::new(|| {
+        make_histogram!(
+            "kbs_deployment_authorization_lookup_seconds",
+            "Deployment authorization lookup and verification latency",
+            vec![0.0005, 0.001, 0.005, 0.01, 0.05, 0.5, 1.0],
+        )
+    });
+
+pub(crate) static DEPLOYMENT_AUTHORIZATION_VERIFY_TOTAL: LazyLock<CounterVec> =
+    LazyLock::new(|| {
+        make_counter_vec!(
+            "kbs_deployment_authorization_verify_total",
+            "Deployment authorization schema/signature verification outcomes",
+            ["result"]
+        )
+    });
+
+pub(crate) static STATIC_RESOURCE_POLICY_BYTES: LazyLock<IntGauge> = LazyLock::new(|| {
+    IntGauge::with_opts(Opts::new(
+        "kbs_static_resource_policy_bytes",
+        "Exact signed static resource-policy artifact size",
+    ))
+    .unwrap()
+});
+
+pub(crate) static STATIC_RESOURCE_POLICY_DIGEST_INFO: LazyLock<GaugeVec> = LazyLock::new(|| {
+    GaugeVec::new(
+        Opts::new(
+            "kbs_static_resource_policy_digest_info",
+            "Current static resource-policy SHA-256 release digest",
+        ),
+        &["sha256"],
+    )
+    .unwrap()
+});
+
+pub(crate) static DEPLOYMENT_AUTHORIZATION_PUBLISHER_TOTAL: LazyLock<CounterVec> =
+    LazyLock::new(|| {
+        make_counter_vec!(
+            "kbs_deployment_authorization_publisher_request_total",
+            "Scoped deployment authorization publisher outcomes",
+            ["operation", "result"]
+        )
+    });
+
 /// KBS Attestation Requests Total
 pub(crate) static ATTESTATION_REQUESTS: LazyLock<Counter> = LazyLock::new(|| {
     make_counter!(
@@ -229,6 +285,24 @@ static INSTANCE: LazyLock<Registry> = LazyLock::new(|| {
         .register(Box::new(KBS_POLICY_ERRORS.clone()))
         .unwrap();
     registry
+        .register(Box::new(DEPLOYMENT_AUTHORIZATION_LOOKUPS_TOTAL.clone()))
+        .unwrap();
+    registry
+        .register(Box::new(DEPLOYMENT_AUTHORIZATION_LOOKUP_SECONDS.clone()))
+        .unwrap();
+    registry
+        .register(Box::new(DEPLOYMENT_AUTHORIZATION_VERIFY_TOTAL.clone()))
+        .unwrap();
+    registry
+        .register(Box::new(STATIC_RESOURCE_POLICY_BYTES.clone()))
+        .unwrap();
+    registry
+        .register(Box::new(STATIC_RESOURCE_POLICY_DIGEST_INFO.clone()))
+        .unwrap();
+    registry
+        .register(Box::new(DEPLOYMENT_AUTHORIZATION_PUBLISHER_TOTAL.clone()))
+        .unwrap();
+    registry
         .register(Box::new(ATTESTATION_REQUESTS.clone()))
         .unwrap();
     registry
@@ -260,8 +334,9 @@ pub(crate) fn export_metrics() -> Result<String, prometheus::Error> {
 #[cfg(test)]
 mod tests {
     use crate::prometheus::{
-        export_metrics, REQUEST_DURATION, REQUEST_SIZES, REQUEST_TOTAL, RESOURCE_READS_TOTAL,
-        RESOURCE_WRITES_TOTAL, RESPONSE_SIZES,
+        export_metrics, DEPLOYMENT_AUTHORIZATION_VERIFY_TOTAL, REQUEST_DURATION, REQUEST_SIZES,
+        REQUEST_TOTAL, RESOURCE_READS_TOTAL, RESOURCE_WRITES_TOTAL, RESPONSE_SIZES,
+        STATIC_RESOURCE_POLICY_BYTES, STATIC_RESOURCE_POLICY_DIGEST_INFO,
     };
 
     #[test]
@@ -281,6 +356,13 @@ mod tests {
         REQUEST_DURATION.observe(10.0);
         REQUEST_SIZES.observe(1024.0);
         RESPONSE_SIZES.observe(2048.0);
+        DEPLOYMENT_AUTHORIZATION_VERIFY_TOTAL
+            .with_label_values(&["success"])
+            .inc();
+        STATIC_RESOURCE_POLICY_BYTES.set(1234);
+        STATIC_RESOURCE_POLICY_DIGEST_INFO
+            .with_label_values(&["ab".repeat(32).as_str()])
+            .set(1.0);
 
         let metrics = export_metrics().unwrap();
         assert!(metrics.contains("resource_reads_total{resource_path=\"default/key/read\"} 2"));
@@ -293,5 +375,8 @@ mod tests {
         assert!(metrics.contains("http_request_size_bytes_count 1"));
         assert!(metrics.contains("http_response_size_bytes_sum 2048"));
         assert!(metrics.contains("http_response_size_bytes_count 1"));
+        assert!(metrics.contains("kbs_deployment_authorization_verify_total{result=\"success\"}"));
+        assert!(metrics.contains("kbs_static_resource_policy_bytes 1234"));
+        assert!(metrics.contains("kbs_static_resource_policy_digest_info"));
     }
 }

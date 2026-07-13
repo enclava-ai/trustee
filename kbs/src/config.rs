@@ -11,7 +11,10 @@ use config::{Config, File};
 use key_value_storage::StorageBackendConfig;
 use serde::Deserialize;
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+};
 
 const DEFAULT_INSECURE_HTTP: bool = false;
 const DEFAULT_SOCKET: &str = "127.0.0.1:8080";
@@ -70,6 +73,14 @@ pub struct PolicyEngineConfig {
     /// artifacts when `require_signed_policy` is true.
     pub signed_policy_public_key: Option<String>,
 
+    /// Exact SHA-256 of the signed static resource-policy artifact bytes.
+    /// Receipt mode requires this release pin in addition to signature
+    /// verification so a different validly signed artifact cannot start.
+    pub static_resource_policy_sha256: Option<String>,
+
+    /// Expected issuer key id embedded in the signed static policy wrapper.
+    pub static_policy_issuer_key_id: Option<String>,
+
     /// Optional explicit allowlist of customer/org owner public keys that may
     /// authorize signed policy artifacts through an owner-signed org keyring.
     pub trusted_org_owner_public_keys: Vec<String>,
@@ -80,6 +91,13 @@ pub struct PolicyEngineConfig {
     /// Do not populate this from CAP or from the artifact itself. It is an
     /// independent Trustee trust anchor for customer/CI-signed artifacts.
     pub trusted_descriptor_public_keys: Vec<String>,
+
+    /// Require a verified per-descriptor deployment authorization before
+    /// evaluating resource policy for attested workload requests.
+    pub require_deployment_authorization: bool,
+
+    /// Independent authorization issuer trust map keyed by receipt key id.
+    pub deployment_authorization_public_keys: BTreeMap<String, String>,
 }
 
 /// Contains all configurable KBS properties.
@@ -215,8 +233,12 @@ mod tests {
             policy_path: Some("/opt/confidential-containers/opa/policy.rego".into()),
             require_signed_policy: false,
             signed_policy_public_key: None,
+            static_resource_policy_sha256: None,
+            static_policy_issuer_key_id: None,
             trusted_org_owner_public_keys: Vec::new(),
             trusted_descriptor_public_keys: Vec::new(),
+            require_deployment_authorization: false,
+            deployment_authorization_public_keys: std::collections::BTreeMap::new(),
         },
         storage_backend: StorageBackendConfig {
             storage_type: KeyValueStorageType::LocalJson,
@@ -269,8 +291,12 @@ mod tests {
             policy_path: Some("/opt/confidential-containers/opa/policy.rego".into()),
             require_signed_policy: false,
             signed_policy_public_key: None,
+            static_resource_policy_sha256: None,
+            static_policy_issuer_key_id: None,
             trusted_org_owner_public_keys: Vec::new(),
             trusted_descriptor_public_keys: Vec::new(),
+            require_deployment_authorization: false,
+            deployment_authorization_public_keys: std::collections::BTreeMap::new(),
         },
         storage_backend: StorageBackendConfig::default(),
         plugins: vec![PluginsConfig::ResourceStorage(RepositoryConfig::LocalFs {

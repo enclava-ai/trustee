@@ -24,12 +24,16 @@ use tracing::{info, warn};
 use crate::{
     admin::Admin,
     config::KbsConfig,
+    deployment_authorization::{AuthorizationStore, VerifiedAuthorization},
     jwe::jwe,
     plugins::PluginManager,
     policy_artifact,
     prometheus::{
-        ACTIVE_CONNECTIONS, BUILD_INFO, KBS_POLICY_APPROVALS, KBS_POLICY_ERRORS, KBS_POLICY_EVALS,
-        KBS_POLICY_VIOLATIONS, REQUEST_DURATION, REQUEST_SIZES, REQUEST_TOTAL,
+        ACTIVE_CONNECTIONS, BUILD_INFO, DEPLOYMENT_AUTHORIZATION_LOOKUPS_TOTAL,
+        DEPLOYMENT_AUTHORIZATION_LOOKUP_SECONDS, DEPLOYMENT_AUTHORIZATION_PUBLISHER_TOTAL,
+        KBS_POLICY_APPROVALS, KBS_POLICY_ERRORS, KBS_POLICY_EVALS, KBS_POLICY_VIOLATIONS,
+        REQUEST_DURATION, REQUEST_SIZES, REQUEST_TOTAL, STATIC_RESOURCE_POLICY_BYTES,
+        STATIC_RESOURCE_POLICY_DIGEST_INFO,
     },
     token::TokenVerifier,
     Error, Result,
@@ -41,6 +45,7 @@ use crate::attestation::backend::{EvidenceRuntimeData, IndependentEvidence};
 const KBS_PREFIX: &str = "/kbs/v0";
 
 pub const KBS_STORAGE_NAMESPACE: &str = "kbs";
+pub const DEPLOYMENT_AUTHORIZATION_STORAGE_NAMESPACE: &str = "deployment_authorizations";
 
 /// The name of the policy rule that determines if the request is allowed or denied
 pub const KBS_POLICY_RULE: &str = "data.policy.allow";
@@ -51,6 +56,8 @@ pub const KBS_POLICY_ID: &str = "resource-policy";
 const KBS_ATTESTATION_VERIFY_BEARER_TOKEN_ENV: &str = "KBS_ATTESTATION_VERIFY_BEARER_TOKEN";
 const KBS_ATTESTATION_VERIFY_ALLOW_UNAUTHENTICATED_ENV: &str =
     "KBS_ATTESTATION_VERIFY_ALLOW_UNAUTHENTICATED";
+const KBS_DEPLOYMENT_AUTHORIZATION_PUBLISHER_TOKEN_ENV: &str =
+    "KBS_DEPLOYMENT_AUTHORIZATION_PUBLISHER_TOKEN";
 
 macro_rules! kbs_path {
     ($path:expr) => {
@@ -67,6 +74,7 @@ pub struct ApiServer {
     attestation_service: crate::attestation::AttestationService,
 
     pub policy_engine: PolicyEngine<Regorus>,
+    authorization_store: std::sync::Arc<AuthorizationStore>,
     admin: Admin,
     config: KbsConfig,
     token_verifier: TokenVerifier,
@@ -168,6 +176,8 @@ impl ApiServer {
     }
 
     pub async fn new(config: KbsConfig) -> Result<Self> {
+        crate::deployment_authorization::validate_config(&config.policy_engine)
+            .map_err(|source| Error::PolicyInitializationFailed { source })?;
         policy_artifact::validate_config(&config.policy_engine)
             .map_err(|source| Error::PolicyInitializationFailed { source })?;
 
@@ -182,11 +192,35 @@ impl ApiServer {
             .to_client_with_namespace(config.storage_backend.storage_type, KBS_STORAGE_NAMESPACE)
             .await
             .map_err(|e| Error::StorageBackendInitialization { source: e })?;
+        let authorization_storage_backend = config
+            .storage_backend
+            .backends
+            .to_client_with_namespace(
+                config.storage_backend.storage_type,
+                DEPLOYMENT_AUTHORIZATION_STORAGE_NAMESPACE,
+            )
+            .await
+            .map_err(|e| Error::StorageBackendInitialization { source: e })?;
         let policy_engine = PolicyEngine::new(policy_storage_backend);
         let startup_policy = Self::startup_policy(&config)?;
         let startup_policy =
             policy_artifact::policy_for_storage(&config.policy_engine, &startup_policy)
                 .map_err(|source| Error::PolicyInitializationFailed { source })?;
+        if config.policy_engine.require_deployment_authorization {
+            STATIC_RESOURCE_POLICY_BYTES
+                .set(i64::try_from(startup_policy.len()).unwrap_or(i64::MAX));
+            STATIC_RESOURCE_POLICY_DIGEST_INFO.reset();
+            STATIC_RESOURCE_POLICY_DIGEST_INFO
+                .with_label_values(&[&hex::encode(Sha256::digest(startup_policy.as_bytes()))])
+                .set(1.0);
+        }
+        let existing_policy = policy_engine.get_policy(KBS_POLICY_ID).await.ok();
+        policy_artifact::validate_static_policy_transition(
+            &config.policy_engine,
+            existing_policy.as_deref(),
+            &startup_policy,
+        )
+        .map_err(|source| Error::PolicyInitializationFailed { source })?;
 
         policy_engine
             .set_policy(KBS_POLICY_ID, &startup_policy, true)
@@ -206,6 +240,9 @@ impl ApiServer {
             config,
             plugin_manager,
             policy_engine,
+            authorization_store: std::sync::Arc::new(AuthorizationStore::new(
+                authorization_storage_backend,
+            )),
             admin,
             token_verifier,
 
@@ -253,6 +290,18 @@ impl ApiServer {
                             .route(web::delete().to(workload_resource_api)),
                     )
                     .service(
+                        web::resource(kbs_path!(
+                            "deployment-authorization/{descriptor_hash}/revoke"
+                        ))
+                        .route(web::post().to(revoke_deployment_authorization)),
+                    )
+                    .service(
+                        web::resource(kbs_path!("deployment-authorization/{descriptor_hash}"))
+                            .route(web::put().to(publish_deployment_authorization))
+                            .route(web::get().to(readback_deployment_authorization))
+                            .route(web::delete().to(deactivate_deployment_authorization)),
+                    )
+                    .service(
                         web::resource([kbs_path!("{path:.*}")])
                             .route(web::get().to(api))
                             .route(web::post().to(api))
@@ -289,6 +338,150 @@ impl ApiServer {
     }
 }
 
+fn endpoint_descriptor_hash(raw: &str) -> Result<[u8; 32]> {
+    if raw.len() != 64
+        || !raw
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(Error::DeploymentAuthorizationInvalid);
+    }
+    hex::decode(raw)
+        .map_err(|_| Error::DeploymentAuthorizationInvalid)?
+        .try_into()
+        .map_err(|_| Error::DeploymentAuthorizationInvalid)
+}
+
+fn map_authorization_store_error(error: anyhow::Error) -> Error {
+    let message = error.to_string();
+    if error.chain().any(|cause| {
+        cause
+            .to_string()
+            .contains("deployment authorization storage")
+    }) {
+        Error::DeploymentAuthorizationStorage { source: error }
+    } else if message.contains("immutable") || message.contains("terminally revoked") {
+        Error::DeploymentAuthorizationConflict
+    } else {
+        warn!(error = %error, "deployment authorization operation failed");
+        Error::DeploymentAuthorizationInvalid
+    }
+}
+
+fn map_authorization_readback_error(error: anyhow::Error) -> Error {
+    if error.chain().any(|cause| {
+        cause
+            .to_string()
+            .contains("deployment authorization storage")
+    }) {
+        Error::DeploymentAuthorizationStorage { source: error }
+    } else {
+        Error::DeploymentAuthorizationNotFound
+    }
+}
+
+async fn resolve_deployment_authorization(
+    core: &ApiServer,
+    claims: &serde_json::Value,
+) -> anyhow::Result<VerifiedAuthorization> {
+    let timer = DEPLOYMENT_AUTHORIZATION_LOOKUP_SECONDS.start_timer();
+    let result = core
+        .authorization_store
+        .resolve(&core.config.policy_engine, claims)
+        .await;
+    timer.observe_duration();
+    DEPLOYMENT_AUTHORIZATION_LOOKUPS_TOTAL
+        .with_label_values(&[if result.is_ok() { "success" } else { "deny" }])
+        .inc();
+    result
+}
+
+async fn publish_deployment_authorization(
+    request: HttpRequest,
+    body: web::Bytes,
+    core: web::Data<ApiServer>,
+    descriptor_hash: web::Path<String>,
+) -> Result<HttpResponse> {
+    verify_deployment_authorization_publisher(&request)?;
+    if body.len() > crate::deployment_authorization::MAX_BYTES {
+        return Err(Error::PayloadTooLarge);
+    }
+    let descriptor_hash = endpoint_descriptor_hash(&descriptor_hash)?;
+    let result = core
+        .authorization_store
+        .publish(&core.config.policy_engine, &descriptor_hash, &body)
+        .await;
+    DEPLOYMENT_AUTHORIZATION_PUBLISHER_TOTAL
+        .with_label_values(&["publish", if result.is_ok() { "success" } else { "error" }])
+        .inc();
+    result.map_err(map_authorization_store_error)?;
+    Ok(HttpResponse::Created().finish())
+}
+
+async fn readback_deployment_authorization(
+    request: HttpRequest,
+    core: web::Data<ApiServer>,
+    descriptor_hash: web::Path<String>,
+) -> Result<HttpResponse> {
+    verify_deployment_authorization_publisher(&request)?;
+    let descriptor_hash = endpoint_descriptor_hash(&descriptor_hash)?;
+    let result = core
+        .authorization_store
+        .publisher_readback(&descriptor_hash)
+        .await;
+    DEPLOYMENT_AUTHORIZATION_PUBLISHER_TOTAL
+        .with_label_values(&["readback", if result.is_ok() { "success" } else { "error" }])
+        .inc();
+    let bytes = result.map_err(map_authorization_readback_error)?;
+    Ok(HttpResponse::Ok()
+        .content_type("application/json")
+        .body(bytes))
+}
+
+async fn deactivate_deployment_authorization(
+    request: HttpRequest,
+    core: web::Data<ApiServer>,
+    descriptor_hash: web::Path<String>,
+) -> Result<HttpResponse> {
+    verify_deployment_authorization_publisher(&request)?;
+    let descriptor_hash = endpoint_descriptor_hash(&descriptor_hash)?;
+    let result = core.authorization_store.deactivate(&descriptor_hash).await;
+    DEPLOYMENT_AUTHORIZATION_PUBLISHER_TOTAL
+        .with_label_values(&[
+            "deactivate",
+            if result.is_ok() { "success" } else { "error" },
+        ])
+        .inc();
+    result.map_err(map_authorization_store_error)?;
+    Ok(HttpResponse::NoContent().finish())
+}
+
+async fn revoke_deployment_authorization(
+    request: HttpRequest,
+    body: web::Bytes,
+    core: web::Data<ApiServer>,
+    descriptor_hash: web::Path<String>,
+) -> Result<HttpResponse> {
+    verify_deployment_authorization_publisher(&request)?;
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct RevokeRequest {
+        reason: String,
+    }
+    let request_body: RevokeRequest =
+        serde_json::from_slice(&body).map_err(|_| Error::DeploymentAuthorizationInvalid)?;
+    if request_body.reason.trim().is_empty() || request_body.reason.len() > 1024 {
+        return Err(Error::DeploymentAuthorizationInvalid);
+    }
+    let descriptor_hash = endpoint_descriptor_hash(&descriptor_hash)?;
+    let result = core.authorization_store.revoke(&descriptor_hash).await;
+    DEPLOYMENT_AUTHORIZATION_PUBLISHER_TOTAL
+        .with_label_values(&["revoke", if result.is_ok() { "success" } else { "error" }])
+        .inc();
+    result.map_err(map_authorization_store_error)?;
+    Ok(HttpResponse::NoContent().finish())
+}
+
 /// APIs
 pub(crate) async fn api(
     request: HttpRequest,
@@ -320,7 +513,6 @@ pub(crate) async fn api(
     let policy_data =
         build_plugin_policy_data(request.method().as_str(), plugin, resource_path, &query);
 
-    let policy_data_str = policy_data.to_string();
     match plugin {
         #[cfg(feature = "as")]
         "auth" if request.method() == Method::POST => core
@@ -417,6 +609,13 @@ pub(crate) async fn api(
             })?;
             let policy = policy_artifact::policy_for_storage(&core.config.policy_engine, &policy)
                 .map_err(|source| Error::ParsePolicyError { source })?;
+            let existing_policy = core.policy_engine.get_policy(KBS_POLICY_ID).await.ok();
+            policy_artifact::validate_static_policy_transition(
+                &core.config.policy_engine,
+                existing_policy.as_deref(),
+                &policy,
+            )
+            .map_err(|source| Error::ParsePolicyError { source })?;
 
             core.policy_engine
                 .set_policy(KBS_POLICY_ID, &policy, true)
@@ -504,11 +703,35 @@ pub(crate) async fn api(
                 let claims = core.token_verifier.verify(token).await?;
 
                 let claim_str = serde_json::to_string(&claims)?;
+                let mut request_policy_data = policy_data.clone();
+                let verified_authorization = if core
+                    .config
+                    .policy_engine
+                    .require_deployment_authorization
+                {
+                    let verified = resolve_deployment_authorization(&core, &claims)
+                        .await
+                        .map_err(|error| {
+                            warn!(error = %error, "deployment authorization resolver denied request");
+                            Error::PolicyDeny
+                        })?;
+                    let requested_path = resource_path.join("/");
+                    if !verified.authorizes_path(&requested_path) {
+                        return Err(Error::PolicyDeny);
+                    }
+                    verified
+                        .inject_policy_data(&mut request_policy_data)
+                        .map_err(|_| Error::PolicyDeny)?;
+                    Some(verified)
+                } else {
+                    None
+                };
+                let request_policy_data_str = request_policy_data.to_string();
 
                 KBS_POLICY_EVALS.inc();
                 // TODO: add policy filter support for other plugins
                 let policy_result = core
-                    .evaluate_resource_policy(Some(&policy_data_str), &claim_str)
+                    .evaluate_resource_policy(Some(&request_policy_data_str), &claim_str)
                     .await
                     .inspect_err(|_| KBS_POLICY_ERRORS.inc())?;
                 if !policy_allows(&policy_result) {
@@ -517,10 +740,23 @@ pub(crate) async fn api(
                 }
                 KBS_POLICY_APPROVALS.inc();
 
-                let response = plugin
-                    .handle(&body, &query, resource_path, request.method())
-                    .await
-                    .map_err(|e| Error::PluginInternalError { source: e })?;
+                let requested_path = resource_path.join("/");
+                let response = if plugin_name == "resource"
+                    && resource_path.len() == 3
+                    && resource_path[0] == "default"
+                    && resource_path[1] == "policy-receipts"
+                {
+                    let verified = verified_authorization.as_ref().ok_or(Error::PolicyDeny)?;
+                    if verified.authorization.receipt_resource_path != requested_path {
+                        return Err(Error::PolicyDeny);
+                    }
+                    verified.exact_bytes.clone()
+                } else {
+                    plugin
+                        .handle(&body, &query, resource_path, request.method())
+                        .await
+                        .map_err(|e| Error::PluginInternalError { source: e })?
+                };
                 if plugin
                     .encrypted(&body, &query, resource_path, request.method())
                     .await
@@ -973,6 +1209,26 @@ fn verify_attestation_verify_caller_auth(request: &HttpRequest, expected: &str) 
     Err(Error::AttestationVerifyAuthInvalid)
 }
 
+fn verify_deployment_authorization_publisher(request: &HttpRequest) -> Result<()> {
+    let result = (|| {
+        let expected = env_nonempty(KBS_DEPLOYMENT_AUTHORIZATION_PUBLISHER_TOKEN_ENV)
+            .ok_or(Error::DeploymentAuthorizationPublisherAuthRequired)?;
+        let supplied = attestation_verify_caller_bearer(request)
+            .map_err(|_| Error::DeploymentAuthorizationPublisherAuthInvalid)?;
+        if constant_time_eq(supplied.as_bytes(), expected.as_bytes()) {
+            Ok(())
+        } else {
+            Err(Error::DeploymentAuthorizationPublisherAuthInvalid)
+        }
+    })();
+    if result.is_err() {
+        DEPLOYMENT_AUTHORIZATION_PUBLISHER_TOTAL
+            .with_label_values(&["authenticate", "unauthorized"])
+            .inc();
+    }
+    result
+}
+
 fn attestation_verify_token(request: &HttpRequest, body: &[u8]) -> Result<String> {
     if let Some(required_caller_token) = env_nonempty(KBS_ATTESTATION_VERIFY_BEARER_TOKEN_ENV) {
         verify_attestation_verify_caller_auth(request, &required_caller_token)?;
@@ -1123,13 +1379,27 @@ pub(crate) async fn workload_resource_api(
     };
 
     // Construct method-aware policy data
-    let policy_data = build_workload_policy_data_with_attested_receipt(
+    let mut policy_data = build_workload_policy_data_with_attested_receipt(
         method.as_str(),
         &path_parts,
         &body,
         &claims,
         attested_receipt_pubkey_sha256,
     );
+    if core.config.policy_engine.require_deployment_authorization {
+        let verified = resolve_deployment_authorization(&core, &claims)
+            .await
+            .map_err(|error| {
+                warn!(error = %error, "deployment authorization resolver denied workload resource request");
+                Error::PolicyDeny
+            })?;
+        if !verified.authorizes_path(&path_parts.join("/")) {
+            return Err(Error::PolicyDeny);
+        }
+        verified
+            .inject_policy_data(&mut policy_data)
+            .map_err(|_| Error::PolicyDeny)?;
+    }
     validate_workload_receipt_hard_gate(method.as_str(), &path_parts, &policy_data)?;
     let policy_data_str = policy_data.to_string();
 
@@ -1983,6 +2253,100 @@ mod workload_resource_tests {
         let body = br#"{"token":"workload-attestation-token"}"#;
 
         assert!(attestation_verify_token(&request, body).is_err());
+    }
+
+    #[test]
+    #[serial]
+    fn deployment_authorization_publisher_has_a_dedicated_bearer() {
+        let _token = EnvVarGuard::set(
+            KBS_DEPLOYMENT_AUTHORIZATION_PUBLISHER_TOKEN_ENV,
+            "publisher-secret",
+        );
+        let accepted = actix_web::test::TestRequest::put()
+            .insert_header((header::AUTHORIZATION, "Bearer publisher-secret"))
+            .to_http_request();
+        let rejected = actix_web::test::TestRequest::put()
+            .insert_header((header::AUTHORIZATION, "Bearer other-admin-token"))
+            .to_http_request();
+
+        let unauthorized_before = DEPLOYMENT_AUTHORIZATION_PUBLISHER_TOTAL
+            .with_label_values(&["authenticate", "unauthorized"])
+            .get();
+        assert!(verify_deployment_authorization_publisher(&accepted).is_ok());
+        assert!(matches!(
+            verify_deployment_authorization_publisher(&rejected),
+            Err(Error::DeploymentAuthorizationPublisherAuthInvalid)
+        ));
+        assert_eq!(
+            DEPLOYMENT_AUTHORIZATION_PUBLISHER_TOTAL
+                .with_label_values(&["authenticate", "unauthorized"])
+                .get(),
+            unauthorized_before + 1.0
+        );
+    }
+
+    #[tokio::test]
+    async fn enclava_static_policy_compiles_and_binds_verified_receipt() {
+        let policy = include_str!("../sample_policies/enclava-static-v1.rego");
+        let matching = serde_json::json!({
+            "plugin": "resource",
+            "method": "GET",
+            "resource-path": ["default", "owner", "seed-encrypted"],
+            "authorization_verified": true,
+            "deployment_authorization": {
+                "schema_version": "enclava-kbs-deployment-authorization-v1",
+                "descriptor_core_hash": "aa",
+                "expected_init_data_hash": "bb",
+                "namespace": "tenant-a",
+                "service_account": "app",
+                "tenant_instance_identity_hash": "cc",
+                "image_digest": "sha256:dd",
+                "signer_identity": {"subject": "repo", "issuer": "oidc"},
+                "authorized_resource_paths": ["default/owner/seed-encrypted"]
+            },
+            "canonical_attested_workload": {
+                "descriptor_core_hash": "aa",
+                "init_data_hash": "bb",
+                "namespace": "tenant-a",
+                "service_account": "app",
+                "identity_hash": "cc",
+                "image_digest": "sha256:dd",
+                "signer_identity": {"subject": "repo", "issuer": "oidc"}
+            }
+        });
+        let engine = policy_engine::rego::Regorus {};
+        let result = engine
+            .evaluate(
+                Some(&matching.to_string()),
+                "{}",
+                policy,
+                vec![KBS_POLICY_RULE],
+                vec![],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result.eval_rules_result[KBS_POLICY_RULE],
+            Some(serde_json::Value::Bool(true))
+        );
+
+        let mut mismatched = matching;
+        mismatched["canonical_attested_workload"]["namespace"] =
+            serde_json::Value::String("tenant-b".into());
+        let result = engine
+            .evaluate(
+                Some(&mismatched.to_string()),
+                "{}",
+                policy,
+                vec![KBS_POLICY_RULE],
+                vec![],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result.eval_rules_result[KBS_POLICY_RULE],
+            Some(serde_json::Value::Bool(false))
+        );
     }
 
     #[test]

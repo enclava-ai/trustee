@@ -24,6 +24,27 @@ fn plugin_internal_error_is_not_found(source: &anyhow::Error) -> bool {
 
 #[derive(Error, AsRefStr, Debug)]
 pub enum Error {
+    #[error("Deployment authorization is invalid")]
+    DeploymentAuthorizationInvalid,
+
+    #[error("Deployment authorization conflicts with immutable state")]
+    DeploymentAuthorizationConflict,
+
+    #[error("Deployment authorization was not found or is inactive")]
+    DeploymentAuthorizationNotFound,
+
+    #[error("Deployment authorization publisher authentication is required")]
+    DeploymentAuthorizationPublisherAuthRequired,
+
+    #[error("Deployment authorization publisher authentication failed")]
+    DeploymentAuthorizationPublisherAuthInvalid,
+
+    #[error("Deployment authorization storage failed")]
+    DeploymentAuthorizationStorage {
+        #[source]
+        source: anyhow::Error,
+    },
+
     #[error("Attestation verify caller authentication is required")]
     AttestationVerifyAuthRequired,
 
@@ -149,10 +170,17 @@ impl ResponseError for Error {
             Error::InvalidRequestPath { .. } | Error::PluginNotFound { .. } => {
                 HttpResponse::NotFound()
             }
+            Error::DeploymentAuthorizationNotFound => HttpResponse::NotFound(),
+            Error::DeploymentAuthorizationConflict => HttpResponse::Conflict(),
+            Error::DeploymentAuthorizationPublisherAuthRequired
+            | Error::DeploymentAuthorizationPublisherAuthInvalid => HttpResponse::Unauthorized(),
+            Error::DeploymentAuthorizationStorage { .. } => HttpResponse::InternalServerError(),
             Error::PluginInternalError { source } if plugin_internal_error_is_not_found(source) => {
                 HttpResponse::NotFound()
             }
-            Error::ParsePolicyError { .. } => HttpResponse::BadRequest(),
+            Error::ParsePolicyError { .. } | Error::DeploymentAuthorizationInvalid => {
+                HttpResponse::BadRequest()
+            }
             Error::PayloadTooLarge => HttpResponse::PayloadTooLarge(),
             Error::PreconditionFailed => HttpResponse::PreconditionFailed(),
             _ => HttpResponse::Unauthorized(),
