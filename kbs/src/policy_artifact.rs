@@ -161,9 +161,10 @@ pub(crate) fn verify(
 
 fn verify_policy_body(config: &PolicyEngineConfig, policy_body: &str) -> Result<()> {
     if let Ok(set) = serde_json::from_str::<SignedPolicyArtifactSet>(policy_body) {
-        if set.artifacts.is_empty() {
-            bail!("signed policy artifact set is empty");
-        }
+        // An empty set is the signed-policy representation of deny-all after
+        // the final workload is revoked. It contains no artifact to verify and
+        // is safe to store, while `select_verified_artifact` continues to
+        // reject it for every evaluation and claim.
         for artifact in set.artifacts {
             let _ = verify_artifact(config, artifact)?;
         }
@@ -841,6 +842,32 @@ mod tests {
 
         assert_eq!(rego, new_rego);
         assert_eq!(selected.metadata.descriptor_core_hash, "22".repeat(32));
+    }
+
+    #[test]
+    fn empty_signed_policy_set_is_storable_but_denies_every_claim() {
+        let sk = SigningKey::from_bytes(&[9u8; 32]);
+        let config = signed_policy_config(&sk.verifying_key());
+        let body = serde_json::to_string(&SignedPolicyArtifactSet {
+            schema_version: Some("enclava-signed-policy-set-v2".into()),
+            artifacts: Vec::new(),
+        })
+        .unwrap();
+
+        assert_eq!(policy_for_storage(&config, &body).unwrap(), body);
+
+        for result in [
+            rego_for_evaluation(&config, &body, None),
+            policy_body_for_claims(&config, &body, None),
+        ] {
+            let error = result.expect_err("an empty policy set must fail closed");
+            assert!(
+                error
+                    .to_string()
+                    .contains("signed policy artifact set is empty"),
+                "{error:?}"
+            );
+        }
     }
 
     #[test]

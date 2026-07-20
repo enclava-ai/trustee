@@ -25,6 +25,10 @@ on:
         type: string
         default: ""
         description: features for kbs-client
+      kbs-as-type:
+        type: string
+        default: "coco-as"
+        description: KBS attestation-service feature selected by its Makefile
 
 permissions: {}
 
@@ -69,6 +73,7 @@ jobs:
 
     - name: Build KBS e2e binaries
       env:
+        AS_TYPE: ${{ inputs.kbs-as-type }}
         INPUTS_KBS_CLIENT_FEATURES: ${{ inputs.kbs-client-features }}
       run: |
         make kbs-e2e-build TEST_FEATURES="${INPUTS_KBS_CLIENT_FEATURES}"
