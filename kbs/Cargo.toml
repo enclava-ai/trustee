@@ -26,7 +26,7 @@ coco-as-builtin = [
 coco-as-builtin-snp = ["coco-as", "attestation-service/snp-verifier"]
 
 # Use built-in CoCo-AS as backend attestation service without verifier
-coco-as-builtin-no-verifier = ["coco-as"]
+coco-as-builtin-no-verifier = ["coco-as", "dep:attestation-service"]
 
 # Use remote gRPC CoCo-AS as backend attestation service
 coco-as-grpc = ["coco-as", "mobc", "tonic", "tonic-prost", "prost"]
