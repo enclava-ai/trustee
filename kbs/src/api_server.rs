@@ -987,6 +987,7 @@ fn verify_ed25519(pubkey: &[u8], message: &[u8], signature: &[u8]) -> bool {
     pubkey.verify(message, &signature).is_ok()
 }
 
+#[cfg(feature = "as")]
 fn decode_hex_array<const N: usize>(value: &str) -> Option<[u8; N]> {
     let bytes = hex::decode(value).ok()?;
     bytes.try_into().ok()
