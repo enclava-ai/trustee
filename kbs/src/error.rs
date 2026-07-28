@@ -58,6 +58,12 @@ pub enum Error {
     #[error("Attestation error: {0}")]
     AttestationError(#[from] crate::attestation::Error),
 
+    #[error("Receipt attestation verification is temporarily unavailable")]
+    ReceiptAttestationUnavailable {
+        #[source]
+        source: anyhow::Error,
+    },
+
     #[error("HTTP initialization failed")]
     HTTPFailed {
         #[source]
@@ -183,6 +189,7 @@ impl ResponseError for Error {
             }
             Error::PayloadTooLarge => HttpResponse::PayloadTooLarge(),
             Error::PreconditionFailed => HttpResponse::PreconditionFailed(),
+            Error::ReceiptAttestationUnavailable { .. } => HttpResponse::ServiceUnavailable(),
             _ => HttpResponse::Unauthorized(),
         };
 
@@ -253,5 +260,22 @@ mod tests {
         };
         let resp = actix_web::ResponseError::error_response(&err);
         assert_eq!(resp.status(), actix_web::http::StatusCode::UNAUTHORIZED);
+    }
+
+    #[actix_web::test]
+    async fn receipt_attestation_outage_returns_503_without_source_detail() {
+        let err = Error::ReceiptAttestationUnavailable {
+            source: anyhow!("sensitive upstream detail"),
+        };
+        let resp = actix_web::ResponseError::error_response(&err);
+        assert_eq!(
+            resp.status(),
+            actix_web::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        let body = actix_web::body::to_bytes(resp.into_body())
+            .await
+            .expect("read error body");
+        let body = std::str::from_utf8(&body).expect("utf-8 error body");
+        assert!(!body.contains("sensitive upstream detail"));
     }
 }
