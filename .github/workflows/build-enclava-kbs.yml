@@ -1,4 +1,4 @@
-name: Build and Push Enclava KBS Image
+name: Build and Push Enclava Trustee Runtime Images
 
 on:
   push:
@@ -17,8 +17,24 @@ permissions:
   packages: write
 
 jobs:
-  build-kbs:
+  build-runtime:
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - component: KBS
+            dockerfile: kbs/docker/coco-as-grpc/Dockerfile
+            build_args: --build-arg BUILDPLATFORM=linux/amd64 --build-arg ARCH=x86_64
+            image: ghcr.io/enclava-labs/trustee-kbs-grpc-as
+            digest_file: kbs-image-digest.txt
+            artifact: trustee-kbs-image-digest
+          - component: AS
+            dockerfile: attestation-service/docker/as-grpc/Dockerfile
+            build_args: --build-arg BUILDPLATFORM=linux/amd64 --build-arg ARCH=x86_64 --build-arg VERIFIER=all-verifier
+            image: ghcr.io/enclava-labs/trustee-as-grpc
+            digest_file: as-image-digest.txt
+            artifact: trustee-as-image-digest
     steps:
       - name: Checkout code
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -48,27 +64,26 @@ jobs:
             echo "tag=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Build and push KBS image
+      - name: Build and push ${{ matrix.component }} image
         id: image
         run: |
           docker buildx build --provenance false \
             --platform linux/amd64 \
-            -f kbs/docker/coco-as-grpc/Dockerfile \
-            --build-arg BUILDPLATFORM=linux/amd64 \
-            --build-arg ARCH=x86_64 \
+            -f "${{ matrix.dockerfile }}" \
+            ${{ matrix.build_args }} \
             --push \
-            --metadata-file /tmp/kbs-image-metadata.json \
-            -t ghcr.io/enclava-labs/trustee-kbs-grpc-as:${{ steps.tag.outputs.tag }} \
-            -t ghcr.io/enclava-labs/trustee-kbs-grpc-as:latest \
+            --metadata-file /tmp/image-metadata.json \
+            -t "${{ matrix.image }}:${{ steps.tag.outputs.tag }}" \
+            -t "${{ matrix.image }}:latest" \
             .
 
-          digest="$(jq -r '."containerimage.digest"' /tmp/kbs-image-metadata.json)"
+          digest="$(jq -r '."containerimage.digest"' /tmp/image-metadata.json)"
           if ! [[ "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
             echo "valid containerimage.digest missing from build metadata"
             exit 1
           fi
-          image_ref="ghcr.io/enclava-labs/trustee-kbs-grpc-as@${digest}"
-          printf '%s\n' "${image_ref}" > kbs-image-digest.txt
+          image_ref="${{ matrix.image }}@${digest}"
+          printf '%s\n' "${image_ref}" > "${{ matrix.digest_file }}"
           echo "ref=${image_ref}" >> "$GITHUB_OUTPUT"
 
       - name: Install cosign
@@ -87,7 +102,7 @@ jobs:
       - name: Upload verified immutable image reference
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
-          name: trustee-kbs-image-digest-${{ github.sha }}
-          path: kbs-image-digest.txt
+          name: ${{ matrix.artifact }}-${{ github.sha }}
+          path: ${{ matrix.digest_file }}
           if-no-files-found: error
           retention-days: 90
