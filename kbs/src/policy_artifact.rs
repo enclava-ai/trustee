@@ -153,11 +153,8 @@ pub(crate) fn rego_for_evaluation(
     claim_str: Option<&str>,
 ) -> Result<String> {
     if config.require_signed_policy {
-        if let Ok(policy) = verify_static_policy(config, stored_policy) {
-            return Ok(policy.rego_text);
-        }
         if config.require_deployment_authorization {
-            bail!("receipt mode requires one static signed resource policy");
+            return verify_static_policy(config, stored_policy).map(|policy| policy.rego_text);
         }
         return select_verified_artifact(config, stored_policy, claim_str)
             .map(|artifact| artifact.rego_text);
@@ -172,11 +169,11 @@ pub(crate) fn policy_body_for_claims(
     claim_str: Option<&str>,
 ) -> Result<String> {
     if config.require_signed_policy {
-        if let Ok(policy) = verify_static_policy(config, stored_policy) {
-            return Ok(serde_json::to_string(&policy)?);
-        }
         if config.require_deployment_authorization {
-            bail!("receipt mode requires one static signed resource policy");
+            return Ok(serde_json::to_string(&verify_static_policy(
+                config,
+                stored_policy,
+            )?)?);
         }
         let artifact = select_verified_artifact(config, stored_policy, claim_str)?;
         return Ok(serde_json::to_string(&artifact)?);
@@ -198,15 +195,14 @@ pub(crate) fn validate_static_policy_transition(
     existing: Option<&str>,
     replacement: &str,
 ) -> Result<()> {
-    let replacement = match verify_static_policy(config, replacement) {
-        Ok(policy) => policy,
-        Err(error) if config.require_deployment_authorization => return Err(error),
-        Err(_) => return Ok(()),
-    };
+    if !config.require_deployment_authorization {
+        return Ok(());
+    }
+    let replacement = verify_static_policy(config, replacement)?;
     let Some(existing) = existing else {
         return Ok(());
     };
-    let Ok(existing) = verify_static_policy(config, existing) else {
+    let Ok(existing) = verify_static_policy_signature(config, existing) else {
         return Ok(());
     };
     if replacement.policy_epoch < existing.policy_epoch {
@@ -230,11 +226,9 @@ pub(crate) fn verify(
 }
 
 fn verify_policy_body(config: &PolicyEngineConfig, policy_body: &str) -> Result<()> {
-    if verify_static_policy(config, policy_body).is_ok() {
-        return Ok(());
-    }
     if config.require_deployment_authorization {
-        bail!("receipt mode rejects dynamic signed policy artifacts");
+        let _ = verify_static_policy(config, policy_body)?;
+        return Ok(());
     }
     if let Ok(set) = serde_json::from_str::<SignedPolicyArtifactSet>(policy_body) {
         if set.artifacts.is_empty() {
@@ -254,6 +248,30 @@ fn verify_static_policy(
     config: &PolicyEngineConfig,
     policy_body: &str,
 ) -> Result<StaticSignedPolicy> {
+    if !config.require_deployment_authorization {
+        bail!("static signed resource policies are only accepted in receipt mode");
+    }
+    let policy = verify_static_policy_signature(config, policy_body)?;
+    let expected_digest = config
+        .static_resource_policy_sha256
+        .as_deref()
+        .context("static_resource_policy_sha256 is required in receipt mode")?;
+    let expected_digest =
+        decode_fixed::<32>(expected_digest).context("decode static policy release digest")?;
+    let actual_digest: [u8; 32] = Sha256::digest(policy_body.as_bytes()).into();
+    if actual_digest != expected_digest {
+        bail!("static resource policy release digest mismatch");
+    }
+    if config.static_policy_issuer_key_id.as_deref() != Some(policy.issuer_key_id.as_str()) {
+        bail!("static resource policy issuer key id mismatch");
+    }
+    Ok(policy)
+}
+
+fn verify_static_policy_signature(
+    config: &PolicyEngineConfig,
+    policy_body: &str,
+) -> Result<StaticSignedPolicy> {
     let policy: StaticSignedPolicy =
         serde_json::from_str(policy_body).context("parse static signed resource policy")?;
     if policy.schema_version != STATIC_POLICY_SCHEMA_V1
@@ -262,21 +280,6 @@ fn verify_static_policy(
         || policy.issuer_key_id.is_empty()
     {
         bail!("static signed resource policy contract is invalid");
-    }
-    if config.require_deployment_authorization {
-        let expected_digest = config
-            .static_resource_policy_sha256
-            .as_deref()
-            .context("static_resource_policy_sha256 is required in receipt mode")?;
-        let expected_digest =
-            decode_fixed::<32>(expected_digest).context("decode static policy release digest")?;
-        let actual_digest: [u8; 32] = Sha256::digest(policy_body.as_bytes()).into();
-        if actual_digest != expected_digest {
-            bail!("static resource policy release digest mismatch");
-        }
-        if config.static_policy_issuer_key_id.as_deref() != Some(policy.issuer_key_id.as_str()) {
-            bail!("static resource policy issuer key id mismatch");
-        }
     }
     let declared_hash =
         decode_fixed::<32>(&policy.rego_sha256).context("decode static policy rego_sha256")?;
@@ -970,23 +973,40 @@ mod tests {
     #[test]
     fn static_signed_policy_verifies_and_rejects_epoch_rollback_or_reuse() {
         let sk = SigningKey::from_bytes(&[0x42; 32]);
-        let config = signed_policy_config(&sk.verifying_key());
         let epoch_one = static_policy(&sk, 1, TEST_REGO);
         let epoch_two = static_policy(&sk, 2, "package policy\ndefault allow := false\n");
         let conflicting_epoch_two = static_policy(&sk, 2, "package policy\nallow := true\n");
+        let epoch_one_config = receipt_static_policy_config(&sk.verifying_key(), &epoch_one);
+        let epoch_two_config = receipt_static_policy_config(&sk.verifying_key(), &epoch_two);
+        let conflicting_epoch_two_config =
+            receipt_static_policy_config(&sk.verifying_key(), &conflicting_epoch_two);
 
         assert_eq!(
-            rego_for_evaluation(&config, &epoch_one, None).unwrap(),
+            rego_for_evaluation(&epoch_one_config, &epoch_one, None).unwrap(),
             TEST_REGO
         );
-        validate_static_policy_transition(&config, Some(&epoch_one), &epoch_two).unwrap();
-        assert!(validate_static_policy_transition(&config, Some(&epoch_two), &epoch_one).is_err());
+        validate_static_policy_transition(&epoch_two_config, Some(&epoch_one), &epoch_two).unwrap();
+        assert!(
+            validate_static_policy_transition(&epoch_one_config, Some(&epoch_two), &epoch_one)
+                .is_err()
+        );
         assert!(validate_static_policy_transition(
-            &config,
+            &conflicting_epoch_two_config,
             Some(&epoch_two),
             &conflicting_epoch_two
         )
         .is_err());
+    }
+
+    #[test]
+    fn static_signed_policy_is_rejected_outside_receipt_mode() {
+        let sk = SigningKey::from_bytes(&[0x42; 32]);
+        let body = static_policy(&sk, 1, TEST_REGO);
+        let config = signed_policy_config(&sk.verifying_key());
+
+        assert!(rego_for_evaluation(&config, &body, None).is_err());
+        assert!(policy_body_for_claims(&config, &body, None).is_err());
+        assert!(policy_for_storage(&config, &body).is_err());
     }
 
     #[test]

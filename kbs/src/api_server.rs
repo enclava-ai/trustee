@@ -59,6 +59,36 @@ const KBS_ATTESTATION_VERIFY_ALLOW_UNAUTHENTICATED_ENV: &str =
 const KBS_DEPLOYMENT_AUTHORIZATION_PUBLISHER_TOKEN_ENV: &str =
     "KBS_DEPLOYMENT_AUTHORIZATION_PUBLISHER_TOKEN";
 
+fn validate_deployment_authorization_startup(
+    config: &crate::config::PolicyEngineConfig,
+) -> anyhow::Result<()> {
+    crate::deployment_authorization::validate_config(config)?;
+    if config.require_deployment_authorization
+        && env_nonempty(KBS_DEPLOYMENT_AUTHORIZATION_PUBLISHER_TOKEN_ENV).is_none()
+    {
+        anyhow::bail!(
+            "{KBS_DEPLOYMENT_AUTHORIZATION_PUBLISHER_TOKEN_ENV} is required in receipt mode"
+        );
+    }
+    Ok(())
+}
+
+async fn get_optional_resource_policy(
+    policy_engine: &PolicyEngine<Regorus>,
+) -> Result<Option<String>> {
+    optional_resource_policy_result(policy_engine.get_policy(KBS_POLICY_ID).await)
+}
+
+fn optional_resource_policy_result(
+    result: policy_engine::Result<String>,
+) -> Result<Option<String>> {
+    match result {
+        Ok(policy) => Ok(Some(policy)),
+        Err(policy_engine::PolicyError::PolicyNotFound { .. }) => Ok(None),
+        Err(error) => Err(Error::PolicyEngineError(error)),
+    }
+}
+
 macro_rules! kbs_path {
     ($path:expr) => {
         format!("{}/{}", KBS_PREFIX, $path)
@@ -176,7 +206,7 @@ impl ApiServer {
     }
 
     pub async fn new(config: KbsConfig) -> Result<Self> {
-        crate::deployment_authorization::validate_config(&config.policy_engine)
+        validate_deployment_authorization_startup(&config.policy_engine)
             .map_err(|source| Error::PolicyInitializationFailed { source })?;
         policy_artifact::validate_config(&config.policy_engine)
             .map_err(|source| Error::PolicyInitializationFailed { source })?;
@@ -201,6 +231,14 @@ impl ApiServer {
             )
             .await
             .map_err(|e| Error::StorageBackendInitialization { source: e })?;
+        let authorization_store =
+            std::sync::Arc::new(AuthorizationStore::new(authorization_storage_backend));
+        if config.policy_engine.require_deployment_authorization {
+            authorization_store
+                .validate_storage()
+                .await
+                .map_err(|source| Error::DeploymentAuthorizationStorage { source })?;
+        }
         let policy_engine = PolicyEngine::new(policy_storage_backend);
         let startup_policy = Self::startup_policy(&config)?;
         let startup_policy =
@@ -214,7 +252,7 @@ impl ApiServer {
                 .with_label_values(&[&hex::encode(Sha256::digest(startup_policy.as_bytes()))])
                 .set(1.0);
         }
-        let existing_policy = policy_engine.get_policy(KBS_POLICY_ID).await.ok();
+        let existing_policy = get_optional_resource_policy(&policy_engine).await?;
         policy_artifact::validate_static_policy_transition(
             &config.policy_engine,
             existing_policy.as_deref(),
@@ -240,9 +278,7 @@ impl ApiServer {
             config,
             plugin_manager,
             policy_engine,
-            authorization_store: std::sync::Arc::new(AuthorizationStore::new(
-                authorization_storage_backend,
-            )),
+            authorization_store,
             admin,
             token_verifier,
 
@@ -458,21 +494,10 @@ async fn deactivate_deployment_authorization(
 
 async fn revoke_deployment_authorization(
     request: HttpRequest,
-    body: web::Bytes,
     core: web::Data<ApiServer>,
     descriptor_hash: web::Path<String>,
 ) -> Result<HttpResponse> {
     verify_deployment_authorization_publisher(&request)?;
-    #[derive(serde::Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct RevokeRequest {
-        reason: String,
-    }
-    let request_body: RevokeRequest =
-        serde_json::from_slice(&body).map_err(|_| Error::DeploymentAuthorizationInvalid)?;
-    if request_body.reason.trim().is_empty() || request_body.reason.len() > 1024 {
-        return Err(Error::DeploymentAuthorizationInvalid);
-    }
     let descriptor_hash = endpoint_descriptor_hash(&descriptor_hash)?;
     let result = core.authorization_store.revoke(&descriptor_hash).await;
     DEPLOYMENT_AUTHORIZATION_PUBLISHER_TOTAL
@@ -609,7 +634,7 @@ pub(crate) async fn api(
             })?;
             let policy = policy_artifact::policy_for_storage(&core.config.policy_engine, &policy)
                 .map_err(|source| Error::ParsePolicyError { source })?;
-            let existing_policy = core.policy_engine.get_policy(KBS_POLICY_ID).await.ok();
+            let existing_policy = get_optional_resource_policy(&core.policy_engine).await?;
             policy_artifact::validate_static_policy_transition(
                 &core.config.policy_engine,
                 existing_policy.as_deref(),
@@ -2077,6 +2102,45 @@ mod workload_resource_tests {
         );
     }
 
+    #[test]
+    #[serial]
+    fn receipt_mode_startup_requires_publisher_bearer() {
+        let _token = EnvVarGuard::unset(KBS_DEPLOYMENT_AUTHORIZATION_PUBLISHER_TOKEN_ENV);
+        let config = crate::config::PolicyEngineConfig {
+            require_deployment_authorization: true,
+            deployment_authorization_public_keys: std::collections::BTreeMap::from([(
+                "publisher-1".into(),
+                "00".repeat(32),
+            )]),
+            ..Default::default()
+        };
+
+        assert!(validate_deployment_authorization_startup(&config).is_err());
+
+        let _token = EnvVarGuard::set(
+            KBS_DEPLOYMENT_AUTHORIZATION_PUBLISHER_TOKEN_ENV,
+            "publisher-secret",
+        );
+        validate_deployment_authorization_startup(&config).unwrap();
+    }
+
+    #[test]
+    fn optional_policy_lookup_propagates_storage_failures() {
+        let storage_error = key_value_storage::KeyValueStorageError::GetKeyFailed {
+            source: anyhow::anyhow!("database unavailable"),
+            key: KBS_POLICY_ID.into(),
+        };
+
+        assert!(matches!(
+            optional_resource_policy_result(Err(policy_engine::PolicyError::PolicyStorageError(
+                storage_error
+            ))),
+            Err(Error::PolicyEngineError(
+                policy_engine::PolicyError::PolicyStorageError(_)
+            ))
+        ));
+    }
+
     #[tokio::test]
     async fn enclava_static_policy_compiles_and_binds_verified_receipt() {
         let policy = include_str!("../sample_policies/enclava-static-v1.rego");
@@ -2122,12 +2186,30 @@ mod workload_resource_tests {
             Some(serde_json::Value::Bool(true))
         );
 
-        let mut mismatched = matching;
+        let mut mismatched = matching.clone();
         mismatched["canonical_attested_workload"]["namespace"] =
             serde_json::Value::String("tenant-b".into());
         let result = engine
             .evaluate(
                 Some(&mismatched.to_string()),
+                "{}",
+                policy,
+                vec![KBS_POLICY_RULE],
+                vec![],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result.eval_rules_result[KBS_POLICY_RULE],
+            Some(serde_json::Value::Bool(false))
+        );
+
+        let mut legacy_string_path = matching;
+        legacy_string_path["resource-path"] =
+            serde_json::Value::String("default/owner/seed-encrypted".into());
+        let result = engine
+            .evaluate(
+                Some(&legacy_string_path.to_string()),
                 "{}",
                 policy,
                 vec![KBS_POLICY_RULE],

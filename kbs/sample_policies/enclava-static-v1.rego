@@ -58,11 +58,3 @@ requested_resource_path := path if {
   count(resource_path) == 3
   path := concat("/", resource_path)
 }
-
-requested_resource_path := path if {
-  resource_path := data["resource-path"]
-  is_string(resource_path)
-  parts := split(trim(resource_path, "/"), "/")
-  count(parts) == 3
-  path := concat("/", parts)
-}

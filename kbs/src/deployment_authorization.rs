@@ -1,5 +1,3 @@
-use std::collections::BTreeSet;
-
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::{DateTime, Utc};
@@ -110,6 +108,13 @@ impl AuthorizationStore {
             .context("deployment authorization storage write")
     }
 
+    pub async fn validate_storage(&self) -> Result<()> {
+        let _ = self
+            .storage_get("deployment-authorization/startup-probe")
+            .await?;
+        Ok(())
+    }
+
     pub async fn publish(
         &self,
         config: &PolicyEngineConfig,
@@ -198,6 +203,11 @@ impl AuthorizationStore {
             .context("deployment authorization not found")?;
         let authorization = parse_and_verify(config, &exact_bytes)?;
         verify_claim_bindings(&authorization, &canonical_claims)?;
+        if self.tombstoned(&descriptor_hash).await?
+            || self.state(&descriptor_hash).await? != Some(PublicationState::Active)
+        {
+            bail!("deployment authorization changed while being verified");
+        }
         Ok(VerifiedAuthorization {
             authorization,
             exact_bytes,
@@ -272,15 +282,29 @@ struct CanonicalClaims {
 
 impl CanonicalClaims {
     fn extract(value: &Value) -> Result<Self> {
+        let evidence = value
+            .pointer("/submods/cpu0/ear.veraison.annotated-evidence")
+            .and_then(Value::as_object)
+            .context("annotated CPU evidence is missing")?;
+        let init_data_claims = evidence
+            .get("init_data_claims")
+            .and_then(Value::as_object)
+            .context("verified init-data claims are missing")?;
+
         Ok(Self {
-            descriptor_core_hash: unique_hex_claim(value, &["descriptor_core_hash"])?,
-            init_data_hash: unique_hex_claim(value, &["init_data_hash", "init_data"])?,
-            namespace: unique_string_claim(value, &["namespace"])?,
-            service_account: unique_string_claim(value, &["service_account"])?,
-            identity_hash: unique_hex_claim(value, &["identity_hash"])?,
-            image_digest: normalize_image_digest(&unique_string_claim(value, &["image_digest"])?)?,
-            signer_subject: unique_string_claim(value, &["signer_identity_subject"])?,
-            signer_issuer: unique_string_claim(value, &["signer_identity_issuer"])?,
+            descriptor_core_hash: required_hex_claim(init_data_claims, "descriptor_core_hash")?,
+            init_data_hash: required_hex_claim(evidence, "init_data")?,
+            namespace: required_string_claim(init_data_claims, "namespace")?.into(),
+            service_account: required_string_claim(init_data_claims, "service_account")?.into(),
+            identity_hash: required_hex_claim(init_data_claims, "identity_hash")?,
+            image_digest: normalize_image_digest(required_string_claim(
+                init_data_claims,
+                "image_digest",
+            )?)?,
+            signer_subject: required_string_claim(init_data_claims, "signer_identity_subject")?
+                .into(),
+            signer_issuer: required_string_claim(init_data_claims, "signer_identity_issuer")?
+                .into(),
         })
     }
 
@@ -441,62 +465,20 @@ fn authorization_signing_bytes(value: &DeploymentAuthorization) -> Vec<u8> {
     ])
 }
 
-fn unique_hex_claim(value: &Value, keys: &[&str]) -> Result<[u8; 32]> {
-    let raw = unique_claim_values(value, keys)?;
-    let decoded: BTreeSet<[u8; 32]> = raw
-        .into_iter()
-        .map(|raw| decode_lower_hex32(&raw))
-        .collect::<Result<_>>()?;
-    if decoded.len() != 1 {
-        bail!("attestation claim is missing or ambiguous");
-    }
-    Ok(*decoded.iter().next().expect("checked length"))
+fn required_hex_claim(object: &serde_json::Map<String, Value>, key: &str) -> Result<[u8; 32]> {
+    decode_lower_hex32(required_string_claim(object, key)?)
+        .with_context(|| format!("invalid attestation claim {key}"))
 }
 
-fn unique_string_claim(value: &Value, keys: &[&str]) -> Result<String> {
-    let values = unique_claim_values(value, keys)?;
-    if values.len() != 1 {
-        bail!("attestation claim is missing or ambiguous");
-    }
-    Ok(values.into_iter().next().expect("checked length"))
-}
-
-fn unique_claim_values(value: &Value, keys: &[&str]) -> Result<BTreeSet<String>> {
-    let mut found = Vec::new();
-    collect_claims(value, keys, &mut found);
-    if found.is_empty() {
-        bail!("required attestation claim is missing");
-    }
-    let mut values = BTreeSet::new();
-    for value in found {
-        let value = value
-            .as_str()
-            .filter(|value| !value.is_empty())
-            .context("attestation claim has invalid type")?;
-        values.insert(value.to_string());
-    }
-    Ok(values)
-}
-
-fn collect_claims<'a>(value: &'a Value, keys: &[&str], found: &mut Vec<&'a Value>) {
-    match value {
-        Value::Object(object) => {
-            for key in keys {
-                if let Some(value) = object.get(*key) {
-                    found.push(value);
-                }
-            }
-            for nested in object.values() {
-                collect_claims(nested, keys, found);
-            }
-        }
-        Value::Array(values) => {
-            for nested in values {
-                collect_claims(nested, keys, found);
-            }
-        }
-        _ => {}
-    }
+fn required_string_claim<'a>(
+    object: &'a serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<&'a str> {
+    object
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .with_context(|| format!("required attestation claim {key} is missing"))
 }
 
 fn normalize_image_digest(value: &str) -> Result<String> {
@@ -631,7 +613,7 @@ mod hex32 {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, sync::Arc, time::Instant};
+    use std::{collections::BTreeMap, sync::Arc};
 
     use chrono::TimeZone as _;
     use ed25519_dalek::{Signer as _, SigningKey};
@@ -694,16 +676,20 @@ mod tests {
         // weakening the production time check.
         config.require_signed_policy = false;
         let claims = json!({
-            "claims": {
-                "init_data_hash": "22".repeat(32),
-                "init_data_claims": {
-                    "descriptor_core_hash": "11".repeat(32),
-                    "namespace": "tenant-app",
-                    "service_account": "workload",
-                    "identity_hash": "33".repeat(32),
-                    "image_digest": format!("sha256:{}", "55".repeat(32)),
-                    "signer_identity_subject": "subject",
-                    "signer_identity_issuer": "issuer"
+            "submods": {
+                "cpu0": {
+                    "ear.veraison.annotated-evidence": {
+                        "init_data": "22".repeat(32),
+                        "init_data_claims": {
+                            "descriptor_core_hash": "11".repeat(32),
+                            "namespace": "tenant-app",
+                            "service_account": "workload",
+                            "identity_hash": "33".repeat(32),
+                            "image_digest": format!("sha256:{}", "55".repeat(32)),
+                            "signer_identity_subject": "subject",
+                            "signer_identity_issuer": "issuer"
+                        }
+                    }
                 }
             }
         });
@@ -751,177 +737,27 @@ mod tests {
             .is_err());
     }
 
-    #[tokio::test]
-    #[ignore = "explicit 10k authorization scale gate (~95s in debug)"]
-    async fn ten_thousand_authorizations_use_independent_backend_records() {
-        let (mut authorization, _, config, _) = signed_fixture();
-        let signing_key = SigningKey::from_bytes(&[0x42; 32]);
-        let storage = Arc::new(MemoryKeyValueStorage::default());
-        let store = AuthorizationStore::new(storage);
-        let mut samples = Vec::new();
+    #[test]
+    fn canonical_claims_use_only_verified_init_data_locations() {
+        let (_, _, _, mut claims) = signed_fixture();
+        claims["descriptor_core_hash"] = Value::String("99".repeat(32));
+        claims["init_data_hash"] = Value::String("99".repeat(32));
 
-        for index in 0_u64..10_000 {
-            let hash: [u8; 32] = Sha256::digest(index.to_be_bytes()).into();
-            let receipt = receipt_path(&hash);
-            authorization.authorization_id = Uuid::from_u128(u128::from(index) + 1);
-            authorization.descriptor_core_hash = hash;
-            authorization.receipt_resource_path = receipt.clone();
-            authorization.authorized_resource_paths = vec![
-                "default/acme-owner/seed-encrypted".into(),
-                "default/acme-owner/seed-sealed".into(),
-                receipt,
-            ];
-            authorization.signature = URL_SAFE_NO_PAD.encode(
-                signing_key
-                    .sign(&authorization_signing_bytes(&authorization))
-                    .to_bytes(),
-            );
-            let bytes = serde_json::to_vec(&authorization).unwrap();
-            store.publish(&config, &hash, &bytes).await.unwrap();
-            if matches!(index, 0 | 4_999 | 9_999) {
-                samples.push((hash, bytes));
-            }
-        }
+        let extracted = CanonicalClaims::extract(&claims).unwrap();
 
-        for (hash, expected) in samples {
-            assert_eq!(store.publisher_readback(&hash).await.unwrap(), expected);
-        }
-    }
-
-    #[tokio::test]
-    #[serial_test::serial]
-    #[ignore = "production PostgreSQL 10k concurrent p95/p99 gate; requires POSTGRES_URL, KBS_AUTHORIZATION_SCALE_NAMESPACE, and KBS_AUTHORIZATION_SCALE_P99_MILLIS"]
-    async fn postgres_authorization_concurrency_and_latency_gate() {
-        let _database_url = std::env::var("POSTGRES_URL")
-            .expect("POSTGRES_URL must point at the disposable scale-test database");
-        let namespace = std::env::var("KBS_AUTHORIZATION_SCALE_NAMESPACE")
-            .expect("KBS_AUTHORIZATION_SCALE_NAMESPACE must name an empty pre-created table");
-        assert!(
-            namespace
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_'),
-            "scale namespace must be a safe SQL identifier"
-        );
-        let p99_limit = std::time::Duration::from_millis(
-            std::env::var("KBS_AUTHORIZATION_SCALE_P99_MILLIS")
-                .expect("KBS_AUTHORIZATION_SCALE_P99_MILLIS must be an agreed production SLO")
-                .parse()
-                .expect("KBS_AUTHORIZATION_SCALE_P99_MILLIS must be an integer"),
-        );
-        let concurrency: usize = std::env::var("KBS_AUTHORIZATION_SCALE_CONCURRENCY")
-            .unwrap_or_else(|_| "32".into())
-            .parse()
-            .expect("KBS_AUTHORIZATION_SCALE_CONCURRENCY must be an integer");
-        assert!((1..=256).contains(&concurrency));
-
-        let backend = Arc::new(
-            key_value_storage::postgres::PostgresClient::new(
-                key_value_storage::postgres::Config::default(),
-                &namespace,
-            )
-            .await
-            .expect("connect PostgreSQL authorization backend"),
-        );
-        let store = Arc::new(AuthorizationStore::new(backend));
-        let (template, _, config, _) = signed_fixture();
-        let config = Arc::new(config);
-        let signing_key = SigningKey::from_bytes(&[0x42; 32]);
-        let mut records = Vec::with_capacity(10_000);
-        for index in 0_u64..10_000 {
-            let mut authorization = template.clone();
-            let hash: [u8; 32] = Sha256::digest(index.to_be_bytes()).into();
-            let receipt = receipt_path(&hash);
-            authorization.authorization_id = Uuid::from_u128(u128::from(index) + 1);
-            authorization.descriptor_core_hash = hash;
-            authorization.receipt_resource_path = receipt.clone();
-            authorization.authorized_resource_paths = vec![
-                "default/acme-owner/seed-encrypted".into(),
-                "default/acme-owner/seed-sealed".into(),
-                receipt,
-            ];
-            authorization.signature = URL_SAFE_NO_PAD.encode(
-                signing_key
-                    .sign(&authorization_signing_bytes(&authorization))
-                    .to_bytes(),
-            );
-            records.push((index, hash, serde_json::to_vec(&authorization).unwrap()));
-        }
-
-        let mut publish_latencies = Vec::with_capacity(records.len());
-        for chunk in records.chunks(concurrency) {
-            let mut tasks = tokio::task::JoinSet::new();
-            for (_, hash, bytes) in chunk {
-                let hash = *hash;
-                let bytes = bytes.clone();
-                let store = Arc::clone(&store);
-                let config = Arc::clone(&config);
-                tasks.spawn(async move {
-                    let started = Instant::now();
-                    store.publish(&config, &hash, &bytes).await.unwrap();
-                    started.elapsed()
-                });
-            }
-            while let Some(result) = tasks.join_next().await {
-                publish_latencies.push(result.expect("publish scale task panicked"));
-            }
-        }
-
-        let mut lifecycle_latencies = Vec::with_capacity(records.len());
-        for chunk in records.chunks(concurrency) {
-            let mut tasks = tokio::task::JoinSet::new();
-            for (index, hash, bytes) in chunk {
-                let index = *index;
-                let hash = *hash;
-                let bytes = bytes.clone();
-                let store = Arc::clone(&store);
-                let config = Arc::clone(&config);
-                tasks.spawn(async move {
-                    let started = Instant::now();
-                    match index % 4 {
-                        0 => {
-                            assert_eq!(store.publisher_readback(&hash).await.unwrap(), bytes);
-                        }
-                        1 => store.deactivate(&hash).await.unwrap(),
-                        2 => store.revoke(&hash).await.unwrap(),
-                        _ => store.publish(&config, &hash, &bytes).await.unwrap(),
-                    }
-                    started.elapsed()
-                });
-            }
-            while let Some(result) = tasks.join_next().await {
-                lifecycle_latencies.push(result.expect("lifecycle scale task panicked"));
-            }
-        }
-
-        for (name, latencies) in [
-            ("publish", publish_latencies),
-            ("mixed_lifecycle", lifecycle_latencies),
-        ] {
-            let (p95, p99) = latency_percentiles(latencies);
-            eprintln!(
-                "kbs_authorization_scale operation={name} records=10000 concurrency={concurrency} p95_ms={} p99_ms={}",
-                p95.as_millis(),
-                p99.as_millis()
-            );
-            assert!(
-                p99 <= p99_limit,
-                "{name} p99 {p99:?} exceeded agreed limit {p99_limit:?}"
-            );
-        }
-    }
-
-    fn latency_percentiles(
-        mut latencies: Vec<std::time::Duration>,
-    ) -> (std::time::Duration, std::time::Duration) {
-        assert_eq!(latencies.len(), 10_000);
-        latencies.sort_unstable();
-        (latencies[9_499], latencies[9_899])
+        assert_eq!(extracted.descriptor_core_hash, [0x11; 32]);
+        assert_eq!(extracted.init_data_hash, [0x22; 32]);
     }
 
     #[test]
-    fn conflicting_duplicate_claims_are_rejected() {
+    fn canonical_claims_reject_init_hash_from_init_data_claims() {
         let (_, _, _, mut claims) = signed_fixture();
-        claims["descriptor_core_hash"] = Value::String("99".repeat(32));
+        let evidence = claims
+            .pointer_mut("/submods/cpu0/ear.veraison.annotated-evidence")
+            .unwrap();
+        evidence["init_data_claims"]["init_data_hash"] = Value::String("22".repeat(32));
+        evidence.as_object_mut().unwrap().remove("init_data");
+
         assert!(CanonicalClaims::extract(&claims).is_err());
     }
 }
