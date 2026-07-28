@@ -36,7 +36,9 @@ use crate::{
 };
 
 #[cfg(feature = "as")]
-use crate::attestation::backend::{EvidenceRuntimeData, IndependentEvidence};
+use crate::attestation::backend::{
+    EvidenceRuntimeData, IndependentEvidence, IndependentEvidenceVerificationError,
+};
 
 const KBS_PREFIX: &str = "/kbs/v0";
 
@@ -794,7 +796,7 @@ async fn attested_receipt_pubkey_hash(
         return Ok(None);
     }
 
-    let token = core
+    let token = match core
         .attestation_service
         .verify_independent_evidence(vec![IndependentEvidence {
             tee: proof.tee,
@@ -803,7 +805,13 @@ async fn attested_receipt_pubkey_hash(
             init_data: None,
         }])
         .await
-        .map_err(|source| Error::ReceiptAttestationUnavailable { source })?;
+    {
+        Ok(token) => token,
+        Err(IndependentEvidenceVerificationError::Invalid(_)) => return Ok(None),
+        Err(IndependentEvidenceVerificationError::Unavailable(source)) => {
+            return Err(Error::ReceiptAttestationUnavailable { source });
+        }
+    };
     let Ok(claims) = core.token_verifier.verify(token).await else {
         return Ok(None);
     };

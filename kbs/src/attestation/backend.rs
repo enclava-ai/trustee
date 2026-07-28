@@ -72,6 +72,11 @@ pub struct IndependentEvidence {
     pub init_data: Option<InitData>,
 }
 
+pub enum IndependentEvidenceVerificationError {
+    Invalid(anyhow::Error),
+    Unavailable(anyhow::Error),
+}
+
 /// Number of bytes in a nonce.
 const NONCE_SIZE_BYTES: usize = 32;
 
@@ -111,6 +116,12 @@ pub trait Attest: Send + Sync {
     /// Verify Attestation Evidence
     /// Return Attestation Results Token
     async fn verify(&self, evidence_to_verify: Vec<IndependentEvidence>) -> anyhow::Result<String>;
+
+    /// Classify only positively identified backend availability failures as
+    /// retryable. Ambiguous verifier failures remain invalid evidence.
+    fn verify_error_is_unavailable(&self, _source: &anyhow::Error) -> bool {
+        false
+    }
 
     /// generate the Challenge to pass to attester based on Tee and nonce
     async fn generate_challenge(
@@ -278,8 +289,17 @@ impl AttestationService {
     pub async fn verify_independent_evidence(
         &self,
         evidence_to_verify: Vec<IndependentEvidence>,
-    ) -> anyhow::Result<String> {
-        self.inner.verify(evidence_to_verify).await
+    ) -> std::result::Result<String, IndependentEvidenceVerificationError> {
+        self.inner
+            .verify(evidence_to_verify)
+            .await
+            .map_err(|source| {
+                if self.inner.verify_error_is_unavailable(&source) {
+                    IndependentEvidenceVerificationError::Unavailable(source)
+                } else {
+                    IndependentEvidenceVerificationError::Invalid(source)
+                }
+            })
     }
 
     async fn __attest(

@@ -149,6 +149,10 @@ impl Attest for GrpcClientPool {
         Ok(token)
     }
 
+    fn verify_error_is_unavailable(&self, source: &anyhow::Error) -> bool {
+        grpc_verify_error_is_unavailable(source)
+    }
+
     async fn generate_challenge(
         &self,
         tee: Tee,
@@ -225,6 +229,25 @@ impl Attest for GrpcClientPool {
     }
 }
 
+fn grpc_verify_error_is_unavailable(source: &anyhow::Error) -> bool {
+    if source
+        .downcast_ref::<mobc::Error<anyhow::Error>>()
+        .is_some()
+    {
+        return true;
+    }
+
+    source
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<tonic::Status>())
+        .is_some_and(|status| {
+            matches!(
+                status.code(),
+                tonic::Code::Unavailable | tonic::Code::DeadlineExceeded
+            )
+        })
+}
+
 pub struct GrpcManager {
     as_addr: String,
 }
@@ -250,5 +273,31 @@ impl Manager for GrpcManager {
 
     async fn check(&self, conn: Self::Connection) -> Result<Self::Connection, Self::Error> {
         Ok(conn)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::grpc_verify_error_is_unavailable;
+
+    #[test]
+    fn aborted_attestation_evaluation_is_invalid_evidence() {
+        let source = anyhow::Error::new(tonic::Status::aborted("evaluation rejected"));
+
+        assert!(!grpc_verify_error_is_unavailable(&source));
+    }
+
+    #[test]
+    fn unavailable_attestation_service_is_retryable() {
+        let source = anyhow::Error::new(tonic::Status::unavailable("service unavailable"));
+
+        assert!(grpc_verify_error_is_unavailable(&source));
+    }
+
+    #[test]
+    fn connection_pool_failure_is_retryable() {
+        let source = anyhow::Error::new(mobc::Error::<anyhow::Error>::Timeout);
+
+        assert!(grpc_verify_error_is_unavailable(&source));
     }
 }
