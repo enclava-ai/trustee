@@ -142,6 +142,7 @@ impl Snp {
         att_report: AttestationReport,
         proc_gen: ProcessorGeneration,
     ) -> Result<Vec<u8>> {
+        let mut failures = Vec::with_capacity(self.verifier_config.vcek_sources.len());
         for source in &self.verifier_config.vcek_sources {
             let result = match source {
                 VCEKSource::OfflineStore { path } => {
@@ -153,9 +154,12 @@ impl Snp {
                 }
             };
 
-            if let Ok(vcek_bytes) = result {
-                debug!("fetched vcek from {:?}", source);
-                return Ok(vcek_bytes);
+            match result {
+                Ok(vcek_bytes) => {
+                    debug!("fetched vcek from {:?}", source);
+                    return Ok(vcek_bytes);
+                }
+                Err(error) => failures.push(error),
             }
         }
 
@@ -163,7 +167,7 @@ impl Snp {
             "failed to fetch vcek from all configured sources {:?}",
             self.verifier_config.vcek_sources
         );
-        bail!("Failed to fetch VCEK from any configured source")
+        Err(aggregate_vcek_fetch_failures(failures))
     }
 
     fn fetch_vcek_from_offline_store(
@@ -176,8 +180,11 @@ impl Snp {
         let path = path.unwrap_or(KDS_OFFLINE_STORE_PATH.to_string());
         let hw_id = self.parse_hw_id_from_vcek(att_report, proc_gen.clone());
         let vcek_path = format!("{}/vcek/{}/vcek.der", path, hw_id);
-        let vcek_bytes = std::fs::read(&vcek_path)
-            .with_context(|| format!("Failed to read VCEK from offline store at {}", vcek_path))?;
+        let vcek_bytes = std::fs::read(&vcek_path).map_err(|source| {
+            VerificationDependencyUnavailable::new(anyhow::Error::new(source).context(format!(
+                "Failed to read VCEK from offline store at {vcek_path}"
+            )))
+        })?;
         Ok(vcek_bytes)
     }
 
@@ -246,11 +253,16 @@ impl Snp {
         let client = self.build_vcek_client();
         let start = Instant::now();
 
-        let vcek_rsp: ReqwestResponse = client
-            .get(vcek_url.clone())
-            .send()
-            .await
-            .context("Unable to send request for VCEK")?;
+        let vcek_rsp: ReqwestResponse =
+            client
+                .get(vcek_url.clone())
+                .send()
+                .await
+                .map_err(|source| {
+                    VerificationDependencyUnavailable::new(
+                        anyhow::Error::new(source).context("Unable to send request for VCEK"),
+                    )
+                })?;
 
         let duration = start.elapsed();
 
@@ -272,13 +284,49 @@ impl Snp {
                 let vcek_rsp_bytes: Vec<u8> = vcek_rsp
                     .bytes()
                     .await
-                    .context("Unable to parse VCEK")?
+                    .map_err(|source| {
+                        VerificationDependencyUnavailable::new(
+                            anyhow::Error::new(source).context("Unable to read VCEK response body"),
+                        )
+                    })?
                     .to_vec();
                 Ok(vcek_rsp_bytes)
             }
 
-            status => bail!("Unable to fetch VCEK from URL: {status:?}, {vcek_url:?}"),
+            status => Err(kds_status_error(status, &vcek_url)),
         }
+    }
+}
+
+fn aggregate_vcek_fetch_failures(mut failures: Vec<anyhow::Error>) -> anyhow::Error {
+    if failures.is_empty() {
+        return anyhow!("No VCEK sources configured");
+    }
+
+    if let Some(index) = failures
+        .iter()
+        .position(|error| !is_verification_dependency_unavailable(error))
+    {
+        return failures
+            .swap_remove(index)
+            .context("Failed to fetch VCEK from any configured source");
+    }
+
+    VerificationDependencyUnavailable::new(
+        failures
+            .pop()
+            .expect("non-empty VCEK failure list")
+            .context("Failed to fetch VCEK from any configured source"),
+    )
+    .into()
+}
+
+fn kds_status_error(status: StatusCode, vcek_url: &str) -> anyhow::Error {
+    let source = anyhow!("Unable to fetch VCEK from URL: {status:?}, {vcek_url:?}");
+    if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+        VerificationDependencyUnavailable::new(source).into()
+    } else {
+        source
     }
 }
 
@@ -683,6 +731,58 @@ mod tests {
     const VLEK_REPORT: &[u8; 1184] = include_bytes!("../../test_data/snp/test-vlek-report.bin");
     const DYNAMIC_EVIDENCE: &[u8; 6714] =
         include_bytes!("../../../../attestation-service/tests/e2e/evidence.json");
+
+    #[test]
+    fn kds_status_errors_have_exact_availability_classification() {
+        for status in [
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ] {
+            assert!(is_verification_dependency_unavailable(&kds_status_error(
+                status,
+                "https://kds.invalid"
+            )));
+        }
+        for status in [StatusCode::NOT_FOUND, StatusCode::BAD_REQUEST] {
+            assert!(!is_verification_dependency_unavailable(&kds_status_error(
+                status,
+                "https://kds.invalid"
+            )));
+        }
+    }
+
+    #[test]
+    fn invalid_vcek_failure_overrides_dependency_unavailable() {
+        let unavailable = anyhow::Error::new(VerificationDependencyUnavailable::new(anyhow!(
+            "KDS unavailable"
+        )));
+        let invalid = anyhow!("KDS rejected the request");
+
+        let aggregate = aggregate_vcek_fetch_failures(vec![unavailable, invalid]);
+
+        assert!(!is_verification_dependency_unavailable(&aggregate));
+    }
+
+    #[test]
+    fn all_vcek_dependency_failures_remain_unavailable() {
+        let first = anyhow::Error::new(VerificationDependencyUnavailable::new(anyhow!(
+            "offline store unavailable"
+        )));
+        let second = anyhow::Error::new(VerificationDependencyUnavailable::new(anyhow!(
+            "KDS unavailable"
+        )));
+
+        let aggregate = aggregate_vcek_fetch_failures(vec![first, second]);
+
+        assert!(is_verification_dependency_unavailable(&aggregate));
+    }
+
+    #[test]
+    fn empty_vcek_source_list_is_invalid_configuration() {
+        let aggregate = aggregate_vcek_fetch_failures(Vec::new());
+
+        assert!(!is_verification_dependency_unavailable(&aggregate));
+    }
 
     #[test]
     fn check_milan_certificates() {

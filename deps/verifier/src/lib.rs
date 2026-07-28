@@ -6,6 +6,27 @@ use kbs_types::Tee;
 use serde::Deserialize;
 use tracing::debug;
 
+#[derive(Debug, thiserror::Error)]
+#[error("verification dependency unavailable")]
+pub struct VerificationDependencyUnavailable {
+    #[source]
+    source: anyhow::Error,
+}
+
+impl VerificationDependencyUnavailable {
+    pub fn new(source: anyhow::Error) -> Self {
+        Self { source }
+    }
+}
+
+pub fn is_verification_dependency_unavailable(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<VerificationDependencyUnavailable>()
+            .is_some()
+    })
+}
+
 pub mod sample;
 pub mod sample_device;
 
@@ -273,5 +294,27 @@ pub fn regularize_data(data: &[u8], len: usize, data_name: &str, arch: &str) -> 
             debug!("The input {data_name} of {arch} is longer than {len} bytes, will be truncated to {len} bytes.");
             data[..len].to_vec()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_verification_dependency_unavailable, VerificationDependencyUnavailable};
+
+    #[test]
+    fn dependency_unavailable_marker_survives_context() {
+        let error = anyhow::Error::new(VerificationDependencyUnavailable::new(anyhow::anyhow!(
+            "dependency detail"
+        )))
+        .context("verifier evaluate failed");
+
+        assert!(is_verification_dependency_unavailable(&error));
+    }
+
+    #[test]
+    fn ordinary_verification_error_is_not_dependency_unavailable() {
+        let error = anyhow::anyhow!("invalid evidence").context("verifier evaluate failed");
+
+        assert!(!is_verification_dependency_unavailable(&error));
     }
 }
