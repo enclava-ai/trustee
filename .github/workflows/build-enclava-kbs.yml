@@ -49,6 +49,7 @@ jobs:
           fi
 
       - name: Build and push KBS image
+        id: image
         run: |
           docker buildx build --provenance false \
             --platform linux/amd64 \
@@ -61,15 +62,32 @@ jobs:
             -t ghcr.io/enclava-labs/trustee-kbs-grpc-as:latest \
             .
 
+          digest="$(jq -r '."containerimage.digest"' /tmp/kbs-image-metadata.json)"
+          if ! [[ "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "valid containerimage.digest missing from build metadata"
+            exit 1
+          fi
+          image_ref="ghcr.io/enclava-labs/trustee-kbs-grpc-as@${digest}"
+          printf '%s\n' "${image_ref}" > kbs-image-digest.txt
+          echo "ref=${image_ref}" >> "$GITHUB_OUTPUT"
+
       - name: Install cosign
         uses: sigstore/cosign-installer@d58896d6a1865668819e1d91763c7751a165e159 # v3.9.2
 
       - name: Sign pushed digest
-        run: |
-          digest="$(jq -r '."containerimage.digest"' /tmp/kbs-image-metadata.json)"
-          if [ -z "${digest}" ] || [ "${digest}" = "null" ]; then
-            echo "containerimage.digest missing from build metadata"
-            cat /tmp/kbs-image-metadata.json
-            exit 1
-          fi
-          cosign sign --yes "ghcr.io/enclava-labs/trustee-kbs-grpc-as@${digest}"
+        run: cosign sign --yes "${{ steps.image.outputs.ref }}"
+
+      - name: Verify pushed digest signature
+        run: >-
+          cosign verify
+          --certificate-identity "https://github.com/${GITHUB_WORKFLOW_REF}"
+          --certificate-oidc-issuer "https://token.actions.githubusercontent.com"
+          "${{ steps.image.outputs.ref }}"
+
+      - name: Upload verified immutable image reference
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: trustee-kbs-image-digest-${{ github.sha }}
+          path: kbs-image-digest.txt
+          if-no-files-found: error
+          retention-days: 90
