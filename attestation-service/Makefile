@@ -30,7 +30,7 @@ grpc-as:
 	cargo build --bin grpc-as $(release) --no-default-features --features grpc-bin,$(VERIFIER),$(RVPS_FEATURES)
 
 restful-as:
-	cargo build --bin restful-as $(release) --no-default-features --features restful-bin,$(VERIFIER),$(RVPS_FEATURES)
+	cargo build --bin restful-as $(release) --no-default-features --features restful-bin,grpc-bin,$(VERIFIER),$(RVPS_FEATURES)
 
 install:
 	for bin_name in $(BIN_NAMES); do \
