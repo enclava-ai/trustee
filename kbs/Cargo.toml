@@ -30,6 +30,11 @@ coco-as-builtin-snp = ["coco-as", "attestation-service/snp-verifier"]
 coco-as-builtin-no-verifier = [
     "coco-as",
     "dep:attestation-service",
+]
+
+# Development/E2E-only built-in CoCo-AS with dummy Sample verifiers.
+coco-as-builtin-sample-dev = [
+    "coco-as-builtin-no-verifier",
     "attestation-service/sample-verifier",
 ]
 

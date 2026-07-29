@@ -40,6 +40,7 @@ jobs:
     with:
       tee: sample
       tarball: kbs.tar.gz
+      kbs-as-type: "coco-as-builtin-sample-dev"
 
   sample-e2e-arm64:
     name: Sample TEE e2e (arm64)
@@ -54,7 +55,7 @@ jobs:
       runs-on-build: '["ubuntu-22.04-arm"]'
       runs-on-test: '["ubuntu-22.04-arm"]'
       tarball: kbs.tar.gz
-      kbs-as-type: "coco-as-builtin-no-verifier"
+      kbs-as-type: "coco-as-builtin-sample-dev"
       kbs-client-features: "cca-attester"
 
   # Vault integration e2e
