@@ -102,11 +102,9 @@ jobs:
           - instance: ubuntu-24.04
             build_platform: linux/amd64
             target_arch: x86_64
-            verifier: all-verifier
           - instance: ubuntu-24.04-arm
             build_platform: linux/arm64
             target_arch: aarch64
-            verifier: cca-verifier
     runs-on: ${{ matrix.instance }}
     permissions:
       contents: read
@@ -138,7 +136,6 @@ jobs:
         env:
           BUILD_PLATFORM: ${{ matrix.build_platform }}
           TARGET_ARCH: ${{ matrix.target_arch }}
-          VERIFIER: ${{ matrix.verifier }}
         run: make test-kbs-docker-e2e
 
   # Azure vTPM TEE e2e (manual trigger only)
