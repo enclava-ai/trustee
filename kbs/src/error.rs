@@ -37,6 +37,15 @@ pub enum Error {
     #[error("Attestation error: {0}")]
     AttestationError(#[from] crate::attestation::Error),
 
+    #[error("Receipt attestation verification is temporarily unavailable")]
+    ReceiptAttestationUnavailable {
+        #[source]
+        source: anyhow::Error,
+    },
+
+    #[error("Receipt attestation verification is not supported by this KBS build")]
+    ReceiptAttestationUnsupported,
+
     #[error("HTTP initialization failed")]
     HTTPFailed {
         #[source]
@@ -155,6 +164,8 @@ impl ResponseError for Error {
             Error::ParsePolicyError { .. } => HttpResponse::BadRequest(),
             Error::PayloadTooLarge => HttpResponse::PayloadTooLarge(),
             Error::PreconditionFailed => HttpResponse::PreconditionFailed(),
+            Error::ReceiptAttestationUnavailable { .. } => HttpResponse::ServiceUnavailable(),
+            Error::ReceiptAttestationUnsupported => HttpResponse::NotImplemented(),
             _ => HttpResponse::Unauthorized(),
         };
 
@@ -225,5 +236,29 @@ mod tests {
         };
         let resp = actix_web::ResponseError::error_response(&err);
         assert_eq!(resp.status(), actix_web::http::StatusCode::UNAUTHORIZED);
+    }
+
+    #[actix_web::test]
+    async fn receipt_attestation_outage_returns_generic_503() {
+        let err = Error::ReceiptAttestationUnavailable {
+            source: anyhow!("sensitive upstream detail"),
+        };
+        let resp = actix_web::ResponseError::error_response(&err);
+        assert_eq!(
+            resp.status(),
+            actix_web::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        let body = actix_web::body::to_bytes(resp.into_body())
+            .await
+            .expect("read error body");
+        let body = std::str::from_utf8(&body).expect("utf-8 error body");
+        assert!(!body.contains("sensitive upstream detail"));
+    }
+
+    #[test]
+    fn unsupported_receipt_attestation_returns_501() {
+        let err = Error::ReceiptAttestationUnsupported;
+        let resp = actix_web::ResponseError::error_response(&err);
+        assert_eq!(resp.status(), actix_web::http::StatusCode::NOT_IMPLEMENTED);
     }
 }

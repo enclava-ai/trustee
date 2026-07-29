@@ -47,3 +47,8 @@ attestation-service = { path = "../attestation-service", default-features = fals
 kbs-client = { path = "../tools/kbs-client", default-features = false, features = [
     "cca-attester",
 ] }
+
+[dev-dependencies]
+attestation-service = { path = "../attestation-service", default-features = false, features = [
+    "sample-verifier",
+] }

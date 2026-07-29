@@ -14,7 +14,7 @@ pub use kbs_types::{Attestation, HashAlgorithm, Tee};
 use key_value_storage::KeyValueStorageError;
 pub use serde_json::Value;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 use config::Config;
 use rvps::RvpsError;
 use serde::{Deserialize, Serialize};
@@ -22,6 +22,12 @@ use std::collections::HashMap;
 use thiserror::Error;
 use tracing::{debug, info};
 use verifier::{InitDataHash, ReportData, TeeEvidenceParsedClaim};
+
+pub use verifier::VerificationDependencyUnavailable;
+
+pub fn is_verification_dependency_unavailable(error: &anyhow::Error) -> bool {
+    verifier::is_verification_dependency_unavailable(error)
+}
 
 use crate::ear_token::EarAttestationTokenBroker;
 
@@ -227,7 +233,7 @@ impl AttestationService {
             let claims = verifier
                 .evaluate(verification_request.evidence, &report_data, &init_data_hash)
                 .await
-                .map_err(|e| anyhow!("Verifier evaluate failed: {e:?}"))?;
+                .context("Verifier evaluate failed")?;
 
             for (claims_from_tee_evidence, tee_class) in claims {
                 info!(

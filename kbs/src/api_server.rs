@@ -36,7 +36,9 @@ use crate::{
 };
 
 #[cfg(feature = "as")]
-use crate::attestation::backend::{EvidenceRuntimeData, IndependentEvidence};
+use crate::attestation::backend::{
+    EvidenceRuntimeData, IndependentEvidence, IndependentEvidenceVerificationError,
+};
 
 const KBS_PREFIX: &str = "/kbs/v0";
 
@@ -559,7 +561,7 @@ fn build_plugin_policy_data(
 /// Extracted as a helper for unit testing.
 #[cfg(test)]
 pub(crate) fn build_workload_policy_data(method: &str, path_parts: &[&str]) -> serde_json::Value {
-    build_workload_policy_data_with_body(method, path_parts, &[], &serde_json::Value::Null)
+    build_workload_policy_data_with_body(method, path_parts, &[])
 }
 
 #[cfg(test)]
@@ -567,21 +569,18 @@ pub(crate) fn build_workload_policy_data_with_body(
     method: &str,
     path_parts: &[&str],
     body: &[u8],
-    claims: &serde_json::Value,
 ) -> serde_json::Value {
-    build_workload_policy_data_with_attested_receipt(method, path_parts, body, claims, None)
+    build_workload_policy_data_with_attested_receipt(method, path_parts, body, None)
 }
 
 fn build_workload_policy_data_with_attested_receipt(
     method: &str,
     path_parts: &[&str],
     body: &[u8],
-    claims: &serde_json::Value,
     attested_receipt_pubkey_sha256: Option<[u8; 32]>,
 ) -> serde_json::Value {
     let body_sha256 = sha256_hex(body);
-    let parsed_body =
-        workload_request_body_policy_input(body, claims, attested_receipt_pubkey_sha256);
+    let parsed_body = workload_request_body_policy_input(body, attested_receipt_pubkey_sha256);
 
     json!({
         "plugin": "workload-resource",
@@ -622,14 +621,13 @@ struct WorkloadReceiptAttestation {
 
 fn workload_request_body_policy_input(
     body: &[u8],
-    claims: &serde_json::Value,
     attested_receipt_pubkey_sha256: Option<[u8; 32]>,
 ) -> serde_json::Value {
     if body.is_empty() {
         return serde_json::Value::Null;
     }
 
-    match parse_workload_request_body_verified(body, claims, attested_receipt_pubkey_sha256) {
+    match parse_workload_request_body_verified(body, attested_receipt_pubkey_sha256) {
         Ok(value) => value.policy_body,
         Err(err) => json!({
             "parse_error": err.to_string(),
@@ -653,7 +651,6 @@ struct ParsedWorkloadRequestBody {
 
 fn parse_workload_request_body_verified(
     body: &[u8],
-    claims: &serde_json::Value,
     attested_receipt_pubkey_sha256: Option<[u8; 32]>,
 ) -> anyhow::Result<ParsedWorkloadRequestBody> {
     let parsed: WorkloadRequestBody = serde_json::from_slice(body)?;
@@ -671,9 +668,7 @@ fn parse_workload_request_body_verified(
         let signature = policy_artifact::decode_bytes(&receipt.signature)?;
 
         let actual_pubkey_sha256 = sha256_bytes(&pubkey);
-        let expected_pubkey_hash =
-            attested_receipt_pubkey_sha256.or_else(|| receipt_pubkey_hash_from_claims(claims));
-        let pubkey_hash_matches = expected_pubkey_hash
+        let pubkey_hash_matches = attested_receipt_pubkey_sha256
             .map(|expected| actual_pubkey_sha256 == expected)
             .unwrap_or(false);
         let signature_valid = verify_ed25519(&pubkey, &payload, &signature);
@@ -758,83 +753,7 @@ fn verify_ed25519(pubkey: &[u8], message: &[u8], signature: &[u8]) -> bool {
     pubkey.verify(message, &signature).is_ok()
 }
 
-fn receipt_pubkey_hash_from_claims(claims: &serde_json::Value) -> Option<[u8; 32]> {
-    find_claim_string(claims, "receipt_pubkey_sha256")
-        .and_then(decode_hex_array::<32>)
-        .or_else(|| receipt_pubkey_hash_from_report_data(claims))
-}
-
-fn receipt_pubkey_hash_from_report_data(claims: &serde_json::Value) -> Option<[u8; 32]> {
-    find_claim_value(claims, "report_data").and_then(decode_receipt_pubkey_report_data)
-}
-
-fn decode_receipt_pubkey_report_data(value: &serde_json::Value) -> Option<[u8; 32]> {
-    match value {
-        serde_json::Value::String(raw) => {
-            if raw.len() == 64 && raw.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-                return decode_hex_array::<32>(raw);
-            }
-            if raw.len() == 128 && raw.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-                let decoded = hex::decode(raw).ok()?;
-                return decode_receipt_pubkey_report_data_bytes(&decoded);
-            }
-            None
-        }
-        serde_json::Value::Array(values) => {
-            let bytes: Option<Vec<u8>> = values
-                .iter()
-                .map(|value| value.as_u64().and_then(|value| u8::try_from(value).ok()))
-                .collect();
-            decode_receipt_pubkey_report_data_bytes(&bytes?)
-        }
-        _ => None,
-    }
-}
-
-fn decode_receipt_pubkey_report_data_bytes(bytes: &[u8]) -> Option<[u8; 32]> {
-    if bytes.len() == 64 && bytes.iter().all(|byte| byte.is_ascii_hexdigit()) {
-        let ascii = std::str::from_utf8(bytes).ok()?;
-        return decode_hex_array::<32>(ascii);
-    }
-
-    if bytes.len() == 64 {
-        let hash = <[u8; 32]>::try_from(&bytes[32..64]).ok()?;
-        return Some(hash);
-    }
-
-    None
-}
-
-fn find_claim_string<'a>(value: &'a serde_json::Value, key: &str) -> Option<&'a str> {
-    match value {
-        serde_json::Value::Object(map) => {
-            if let Some(value) = map.get(key).and_then(|value| value.as_str()) {
-                return Some(value);
-            }
-            map.values().find_map(|value| find_claim_string(value, key))
-        }
-        serde_json::Value::Array(values) => values
-            .iter()
-            .find_map(|value| find_claim_string(value, key)),
-        _ => None,
-    }
-}
-
-fn find_claim_value<'a>(value: &'a serde_json::Value, key: &str) -> Option<&'a serde_json::Value> {
-    match value {
-        serde_json::Value::Object(map) => {
-            if let Some(value) = map.get(key) {
-                return Some(value);
-            }
-            map.values().find_map(|value| find_claim_value(value, key))
-        }
-        serde_json::Value::Array(values) => {
-            values.iter().find_map(|value| find_claim_value(value, key))
-        }
-        _ => None,
-    }
-}
-
+#[cfg(feature = "as")]
 fn decode_hex_array<const N: usize>(value: &str) -> Option<[u8; N]> {
     let bytes = hex::decode(value).ok()?;
     bytes.try_into().ok()
@@ -848,18 +767,36 @@ fn sha256_hex(value: &[u8]) -> String {
     hex::encode(sha256_bytes(value))
 }
 
+fn require_receipt_attestation_support() -> Result<()> {
+    if cfg!(feature = "as") {
+        Ok(())
+    } else {
+        Err(Error::ReceiptAttestationUnsupported)
+    }
+}
+
+#[cfg(feature = "as")]
+fn receipt_evidence_is_affirming(claims: &serde_json::Value) -> bool {
+    claims
+        .pointer("/submods/cpu0/ear.status")
+        .and_then(serde_json::Value::as_str)
+        == Some("affirming")
+}
+
 #[cfg(feature = "as")]
 async fn attested_receipt_pubkey_hash(
     core: &ApiServer,
     receipt_pubkey_sha256: [u8; 32],
     proof: &WorkloadReceiptAttestation,
-) -> Option<[u8; 32]> {
-    let runtime_hash = decode_hex_array::<32>(&proof.runtime_data)?;
+) -> Result<Option<[u8; 32]>> {
+    let Some(runtime_hash) = decode_hex_array::<32>(&proof.runtime_data) else {
+        return Ok(None);
+    };
     if runtime_hash != receipt_pubkey_sha256 {
-        return None;
+        return Ok(None);
     }
 
-    let token = core
+    let token = match core
         .attestation_service
         .verify_independent_evidence(vec![IndependentEvidence {
             tee: proof.tee,
@@ -868,9 +805,21 @@ async fn attested_receipt_pubkey_hash(
             init_data: None,
         }])
         .await
-        .ok()?;
-    core.token_verifier.verify(token).await.ok()?;
-    Some(runtime_hash)
+    {
+        Ok(token) => token,
+        Err(IndependentEvidenceVerificationError::Invalid(_)) => return Ok(None),
+        Err(IndependentEvidenceVerificationError::Unavailable(source)) => {
+            return Err(Error::ReceiptAttestationUnavailable { source });
+        }
+    };
+    let Ok(claims) = core.token_verifier.verify(token).await else {
+        return Ok(None);
+    };
+    if !receipt_evidence_is_affirming(&claims) {
+        return Ok(None);
+    }
+
+    Ok(Some(runtime_hash))
 }
 
 pub(crate) fn build_policy_body_policy_data(
@@ -1068,6 +1017,7 @@ pub(crate) async fn workload_resource_api(
             path: path.to_string(),
         });
     }
+    require_receipt_attestation_support()?;
 
     // Enforce payload size limit for PUT (64KB max for ciphertext)
     if method == Method::PUT && body.len() > 65536 {
@@ -1102,16 +1052,13 @@ pub(crate) async fn workload_resource_api(
         #[cfg(feature = "as")]
         {
             let mut attested_receipt_pubkey_sha256 = None;
-            if let Ok(parsed_body) = parse_workload_request_body_verified(&body, &claims, None) {
-                if parsed_body.policy_body["receipt"]["pubkey_hash_matches"].as_bool() != Some(true)
-                {
-                    if let (Some(receipt_hash), Some(proof)) = (
-                        parsed_body.receipt_pubkey_sha256,
-                        parsed_body.parsed.receipt_attestation.as_ref(),
-                    ) {
-                        attested_receipt_pubkey_sha256 =
-                            attested_receipt_pubkey_hash(&core, receipt_hash, proof).await;
-                    }
+            if let Ok(parsed_body) = parse_workload_request_body_verified(&body, None) {
+                if let (Some(receipt_hash), Some(proof)) = (
+                    parsed_body.receipt_pubkey_sha256,
+                    parsed_body.parsed.receipt_attestation.as_ref(),
+                ) {
+                    attested_receipt_pubkey_sha256 =
+                        attested_receipt_pubkey_hash(&core, receipt_hash, proof).await?;
                 }
             }
             attested_receipt_pubkey_sha256
@@ -1127,7 +1074,6 @@ pub(crate) async fn workload_resource_api(
         method.as_str(),
         &path_parts,
         &body,
-        &claims,
         attested_receipt_pubkey_sha256,
     );
     validate_workload_receipt_hard_gate(method.as_str(), &path_parts, &policy_data)?;
@@ -1463,7 +1409,7 @@ mod workload_resource_tests {
     }
 
     #[test]
-    fn test_workload_resource_policy_data_includes_verified_receipt_fields() {
+    fn test_workload_resource_policy_data_accepts_attested_receipt_binding() {
         let signing_key = SigningKey::from_bytes(&[9u8; 32]);
         let receipt_pubkey = signing_key.verifying_key().to_bytes();
         let value = b"new encrypted seed";
@@ -1485,23 +1431,12 @@ mod workload_resource_tests {
             "value": STANDARD.encode(value),
         }))
         .unwrap();
-        let mut report_data = [0u8; 64];
-        report_data[32..64].copy_from_slice(&sha256_bytes(&receipt_pubkey));
-        let claims = json!({
-            "submods": {
-                "cpu0": {
-                    "ear.veraison.annotated-evidence": {
-                        "report_data": hex::encode(report_data)
-                    }
-                }
-            }
-        });
 
-        let policy_data = build_workload_policy_data_with_body(
+        let policy_data = build_workload_policy_data_with_attested_receipt(
             "PUT",
             &["default", "test-owner", "seed-encrypted"],
             &body,
-            &claims,
+            Some(sha256_bytes(&receipt_pubkey)),
         );
 
         assert_eq!(policy_data["request"]["method"], "PUT");
@@ -1526,155 +1461,7 @@ mod workload_resource_tests {
     }
 
     #[test]
-    fn test_workload_resource_policy_data_accepts_explicit_pubkey_binding_claim() {
-        let signing_key = SigningKey::from_bytes(&[9u8; 32]);
-        let receipt_pubkey = signing_key.verifying_key().to_bytes();
-        let value = b"new encrypted seed";
-        let value_hash = sha256_bytes(value);
-        let payload = policy_artifact::ce_v1_bytes(&[
-            ("purpose", b"enclava-rekey-v1"),
-            ("resource_path", b"default/test-owner/seed-encrypted"),
-            ("new_value_sha256", value_hash.as_slice()),
-            ("timestamp", b"2026-04-28T00:00:00Z"),
-        ]);
-        let signature = signing_key.sign(&payload).to_bytes();
-        let body = serde_json::to_vec(&json!({
-            "operation": "rekey",
-            "receipt": {
-                "pubkey": STANDARD.encode(receipt_pubkey),
-                "payload_canonical_bytes": STANDARD.encode(&payload),
-                "signature": STANDARD.encode(signature),
-            },
-            "value": STANDARD.encode(value),
-        }))
-        .unwrap();
-        let claims = json!({
-            "receipt_pubkey_sha256": hex::encode(sha256_bytes(&receipt_pubkey))
-        });
-
-        let policy_data = build_workload_policy_data_with_body(
-            "PUT",
-            &["default", "test-owner", "seed-encrypted"],
-            &body,
-            &claims,
-        );
-
-        assert_eq!(
-            policy_data["request"]["body"]["receipt"]["pubkey_hash_matches"],
-            true
-        );
-        validate_workload_receipt_hard_gate(
-            "PUT",
-            &["default", "test-owner", "seed-encrypted"],
-            &policy_data,
-        )
-        .unwrap();
-    }
-
-    #[test]
-    fn test_workload_resource_policy_data_accepts_ascii_report_data_binding_claim() {
-        let signing_key = SigningKey::from_bytes(&[9u8; 32]);
-        let receipt_pubkey = signing_key.verifying_key().to_bytes();
-        let value = b"new encrypted seed";
-        let value_hash = sha256_bytes(value);
-        let payload = policy_artifact::ce_v1_bytes(&[
-            ("purpose", b"enclava-rekey-v1"),
-            ("resource_path", b"default/test-owner/seed-encrypted"),
-            ("new_value_sha256", value_hash.as_slice()),
-            ("timestamp", b"2026-04-28T00:00:00Z"),
-        ]);
-        let signature = signing_key.sign(&payload).to_bytes();
-        let body = serde_json::to_vec(&json!({
-            "operation": "rekey",
-            "receipt": {
-                "pubkey": STANDARD.encode(receipt_pubkey),
-                "payload_canonical_bytes": STANDARD.encode(&payload),
-                "signature": STANDARD.encode(signature),
-            },
-            "value": STANDARD.encode(value),
-        }))
-        .unwrap();
-        let report_data = hex::encode(sha256_bytes(&receipt_pubkey));
-        let claims = json!({
-            "submods": {
-                "cpu0": {
-                    "ear.veraison.annotated-evidence": {
-                        "report_data": report_data.as_bytes()
-                    }
-                }
-            }
-        });
-
-        let policy_data = build_workload_policy_data_with_body(
-            "PUT",
-            &["default", "test-owner", "seed-encrypted"],
-            &body,
-            &claims,
-        );
-
-        assert_eq!(
-            policy_data["request"]["body"]["receipt"]["pubkey_hash_matches"],
-            true
-        );
-    }
-
-    #[test]
-    fn test_workload_resource_policy_data_prefers_attested_receipt_binding_over_report_data() {
-        let signing_key = SigningKey::from_bytes(&[9u8; 32]);
-        let receipt_pubkey = signing_key.verifying_key().to_bytes();
-        let value = b"new encrypted seed";
-        let value_hash = sha256_bytes(value);
-        let payload = policy_artifact::ce_v1_bytes(&[
-            ("purpose", b"enclava-rekey-v1"),
-            ("resource_path", b"default/test-owner/seed-encrypted"),
-            ("new_value_sha256", value_hash.as_slice()),
-            ("timestamp", b"2026-04-28T00:00:00Z"),
-        ]);
-        let signature = signing_key.sign(&payload).to_bytes();
-        let body = serde_json::to_vec(&json!({
-            "operation": "rekey",
-            "receipt": {
-                "pubkey": STANDARD.encode(receipt_pubkey),
-                "payload_canonical_bytes": STANDARD.encode(&payload),
-                "signature": STANDARD.encode(signature),
-            },
-            "value": STANDARD.encode(value),
-        }))
-        .unwrap();
-        let mut report_data = [0u8; 64];
-        report_data[32..64].copy_from_slice(&[7u8; 32]);
-        let claims = json!({
-            "submods": {
-                "cpu0": {
-                    "ear.veraison.annotated-evidence": {
-                        "report_data": hex::encode(report_data)
-                    }
-                }
-            }
-        });
-
-        let policy_data = build_workload_policy_data_with_attested_receipt(
-            "PUT",
-            &["default", "test-owner", "seed-encrypted"],
-            &body,
-            &claims,
-            Some(sha256_bytes(&receipt_pubkey)),
-        );
-
-        assert_eq!(
-            policy_data["request"]["body"]["receipt"]["pubkey_hash_matches"],
-            true
-        );
-        validate_workload_receipt_hard_gate(
-            "PUT",
-            &["default", "test-owner", "seed-encrypted"],
-            &policy_data,
-        )
-        .unwrap();
-    }
-
-    #[test]
-    fn test_workload_resource_policy_data_rejects_missing_pubkey_binding_claim() {
+    fn test_workload_resource_policy_data_rejects_missing_attested_binding() {
         let signing_key = SigningKey::from_bytes(&[9u8; 32]);
         let receipt_pubkey = signing_key.verifying_key().to_bytes();
         let value = b"new encrypted seed";
@@ -1701,7 +1488,6 @@ mod workload_resource_tests {
             "PUT",
             &["default", "test-owner", "seed-encrypted"],
             &body,
-            &json!({}),
         );
 
         assert_eq!(
@@ -1716,6 +1502,60 @@ mod workload_resource_tests {
             )
             .unwrap_err(),
             Error::PolicyDeny
+        ));
+    }
+
+    #[cfg(feature = "as")]
+    #[test]
+    fn receipt_evidence_accepts_exact_affirming_cpu_status() {
+        let claims = json!({
+            "submods": {
+                "cpu0": {
+                    "ear.status": "affirming"
+                }
+            }
+        });
+
+        assert!(receipt_evidence_is_affirming(&claims));
+    }
+
+    #[cfg(feature = "as")]
+    #[test]
+    fn receipt_evidence_rejects_contraindicated_cpu_status() {
+        let claims = json!({
+            "submods": {
+                "cpu0": {
+                    "ear.status": "contraindicated"
+                }
+            }
+        });
+
+        assert!(!receipt_evidence_is_affirming(&claims));
+    }
+
+    #[cfg(feature = "as")]
+    #[test]
+    fn receipt_evidence_rejects_missing_or_spoofed_cpu_status() {
+        let missing = json!({"submods": {"cpu0": {}}});
+        let spoofed = json!({
+            "submods": {
+                "cpu0": {
+                    "ear.status": "contraindicated",
+                    "nested": {"ear.status": "affirming"}
+                }
+            }
+        });
+
+        assert!(!receipt_evidence_is_affirming(&missing));
+        assert!(!receipt_evidence_is_affirming(&spoofed));
+    }
+
+    #[cfg(not(feature = "as"))]
+    #[test]
+    fn resource_only_build_rejects_receipt_mutations_as_unsupported() {
+        assert!(matches!(
+            require_receipt_attestation_support(),
+            Err(Error::ReceiptAttestationUnsupported)
         ));
     }
 
@@ -1740,14 +1580,11 @@ mod workload_resource_tests {
             "value": STANDARD.encode(value),
         }))
         .unwrap();
-        let claims = json!({
-            "receipt_pubkey_sha256": hex::encode(sha256_bytes(&receipt_pubkey))
-        });
-        build_workload_policy_data_with_body(
+        build_workload_policy_data_with_attested_receipt(
             "PUT",
             &["default", "test-owner", "seed-encrypted"],
             &body,
-            &claims,
+            Some(sha256_bytes(&receipt_pubkey)),
         )
     }
 
@@ -1769,7 +1606,6 @@ mod workload_resource_tests {
             "PUT",
             &["default", "test-owner", "seed-encrypted"],
             br#"{"operation":"rekey","value":"AA=="}"#,
-            &json!({}),
         );
 
         assert!(matches!(
@@ -1865,15 +1701,11 @@ mod workload_resource_tests {
             }
         }))
         .unwrap();
-        let claims = json!({
-            "receipt_pubkey_sha256": hex::encode([0u8; 32])
-        });
-
-        let policy_data = build_workload_policy_data_with_body(
+        let policy_data = build_workload_policy_data_with_attested_receipt(
             "DELETE",
             &["default", "test-owner", "seed-encrypted"],
             &body,
-            &claims,
+            Some([0u8; 32]),
         );
 
         assert_eq!(

@@ -6,7 +6,30 @@ use kbs_types::Tee;
 use serde::Deserialize;
 use tracing::debug;
 
+#[derive(Debug, thiserror::Error)]
+#[error("verification dependency unavailable")]
+pub struct VerificationDependencyUnavailable {
+    #[source]
+    source: anyhow::Error,
+}
+
+impl VerificationDependencyUnavailable {
+    pub fn new(source: anyhow::Error) -> Self {
+        Self { source }
+    }
+}
+
+pub fn is_verification_dependency_unavailable(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<VerificationDependencyUnavailable>()
+            .is_some()
+    })
+}
+
+#[cfg(feature = "sample-verifier")]
 pub mod sample;
+#[cfg(feature = "sample-verifier")]
 pub mod sample_device;
 
 #[cfg(feature = "az-snp-vtpm-verifier")]
@@ -115,9 +138,25 @@ pub async fn to_verifier(
                 }
             }
         }
-        Tee::Sample => Ok(Box::<sample::Sample>::default() as Box<dyn Verifier + Send + Sync>),
-        Tee::SampleDevice => Ok(Box::<sample_device::SampleDeviceVerifier>::default()
-            as Box<dyn Verifier + Send + Sync>),
+        Tee::Sample => {
+            cfg_if::cfg_if! {
+                if #[cfg(feature = "sample-verifier")] {
+                    Ok(Box::<sample::Sample>::default() as Box<dyn Verifier + Send + Sync>)
+                } else {
+                    bail!("feature `sample-verifier` is not enabled for `verifier` crate.")
+                }
+            }
+        }
+        Tee::SampleDevice => {
+            cfg_if::cfg_if! {
+                if #[cfg(feature = "sample-verifier")] {
+                    Ok(Box::<sample_device::SampleDeviceVerifier>::default()
+                        as Box<dyn Verifier + Send + Sync>)
+                } else {
+                    bail!("feature `sample-verifier` is not enabled for `verifier` crate.")
+                }
+            }
+        }
         Tee::Sgx => {
             cfg_if::cfg_if! {
                 if #[cfg(feature = "sgx-verifier")] {
@@ -273,5 +312,48 @@ pub fn regularize_data(data: &[u8], len: usize, data_name: &str, arch: &str) -> 
             debug!("The input {data_name} of {arch} is longer than {len} bytes, will be truncated to {len} bytes.");
             data[..len].to_vec()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        is_verification_dependency_unavailable, to_verifier, Tee, VerificationDependencyUnavailable,
+    };
+
+    #[test]
+    fn dependency_unavailable_marker_survives_context() {
+        let error = anyhow::Error::new(VerificationDependencyUnavailable::new(anyhow::anyhow!(
+            "dependency detail"
+        )))
+        .context("verifier evaluate failed");
+
+        assert!(is_verification_dependency_unavailable(&error));
+    }
+
+    #[test]
+    fn ordinary_verification_error_is_not_dependency_unavailable() {
+        let error = anyhow::anyhow!("invalid evidence").context("verifier evaluate failed");
+
+        assert!(!is_verification_dependency_unavailable(&error));
+    }
+
+    #[cfg(all(feature = "snp-verifier", not(feature = "sample-verifier")))]
+    #[tokio::test]
+    async fn snp_only_build_excludes_sample_verifier() {
+        assert!(to_verifier(&Tee::Snp, None).await.is_ok());
+        let error = to_verifier(&Tee::Sample, None)
+            .await
+            .err()
+            .expect("sample verifier must be excluded");
+
+        assert!(error.to_string().contains("sample-verifier"));
+    }
+
+    #[cfg(feature = "sample-verifier")]
+    #[tokio::test]
+    async fn sample_feature_preserves_dev_verifiers() {
+        assert!(to_verifier(&Tee::Sample, None).await.is_ok());
+        assert!(to_verifier(&Tee::SampleDevice, None).await.is_ok());
     }
 }

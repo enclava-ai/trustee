@@ -6,6 +6,7 @@ edition = "2021"
 [features]
 default = ["grpc-bin", "rvps-grpc"]
 all-verifier = ["verifier/all-verifier"]
+sample-verifier = ["verifier/sample-verifier"]
 tdx-verifier = ["verifier/tdx-verifier"]
 sgx-verifier = ["verifier/sgx-verifier"]
 az-snp-vtpm-verifier = ["verifier/az-snp-vtpm-verifier"]

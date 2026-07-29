@@ -90,6 +90,10 @@ impl Attest for BuiltInCoCoAs {
             .await
     }
 
+    fn verify_error_is_unavailable(&self, source: &anyhow::Error) -> bool {
+        built_in_verify_error_is_unavailable(source)
+    }
+
     async fn generate_challenge(
         &self,
         tee: Tee,
@@ -136,6 +140,10 @@ impl Attest for BuiltInCoCoAs {
     }
 }
 
+fn built_in_verify_error_is_unavailable(source: &anyhow::Error) -> bool {
+    attestation_service::is_verification_dependency_unavailable(source)
+}
+
 impl BuiltInCoCoAs {
     pub async fn new(
         config: Config,
@@ -144,5 +152,27 @@ impl BuiltInCoCoAs {
         let config = config.derive_as_config(storage_backend_config);
         let inner = RwLock::new(AttestationService::new(config).await?);
         Ok(Self { inner })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::built_in_verify_error_is_unavailable;
+
+    #[test]
+    fn dependency_unavailable_marker_is_retryable() {
+        let source =
+            anyhow::Error::new(attestation_service::VerificationDependencyUnavailable::new(
+                anyhow::anyhow!("dependency unavailable"),
+            ));
+
+        assert!(built_in_verify_error_is_unavailable(&source));
+    }
+
+    #[test]
+    fn invalid_evidence_is_not_retryable() {
+        let source = anyhow::anyhow!("invalid evidence");
+
+        assert!(!built_in_verify_error_is_unavailable(&source));
     }
 }

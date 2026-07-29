@@ -33,7 +33,7 @@ RUN if [ "$(uname -m)" != "${ARCH}" ]; then \
     export RUSTFLAGS="${RUSTFLAGS_ARGS}"; \
     apt-get install -y ${GCC_PACKAGE}; \
     rustup target add ${RUSTC_TARGET}; fi; \
-    cargo install --path attestation-service --bin restful-as --features restful-bin,${VERIFIER} --locked ${TARGET_FLAG}
+    cargo install --path attestation-service --bin restful-as --no-default-features --features restful-bin,grpc-bin,rvps-grpc,${VERIFIER} --locked ${TARGET_FLAG}
 
 # ubuntu:24.04
 FROM ubuntu@sha256:7c06e91f61fa88c08cc74f7e1b7c69ae24910d745357e0dfe1d2c0322aaf20f9

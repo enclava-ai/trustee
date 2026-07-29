@@ -18,7 +18,8 @@ coco-as = ["as"]
 # Use built-in CoCo-AS as backend attestation service
 coco-as-builtin = [
     "coco-as",
-    "attestation-service/default",
+    "attestation-service/grpc-bin",
+    "attestation-service/rvps-grpc",
     "attestation-service/all-verifier",
 ]
 
@@ -26,7 +27,16 @@ coco-as-builtin = [
 coco-as-builtin-snp = ["coco-as", "attestation-service/snp-verifier"]
 
 # Use built-in CoCo-AS as backend attestation service without verifier
-coco-as-builtin-no-verifier = ["coco-as", "dep:attestation-service"]
+coco-as-builtin-no-verifier = [
+    "coco-as",
+    "dep:attestation-service",
+]
+
+# Development/E2E-only built-in CoCo-AS with dummy Sample verifiers.
+coco-as-builtin-sample-dev = [
+    "coco-as-builtin-no-verifier",
+    "attestation-service/sample-verifier",
+]
 
 # Use remote gRPC CoCo-AS as backend attestation service
 coco-as-grpc = ["coco-as", "mobc", "tonic", "tonic-prost", "prost"]

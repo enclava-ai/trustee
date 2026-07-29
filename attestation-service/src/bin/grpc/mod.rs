@@ -35,6 +35,7 @@ fn to_kbs_tee(tee: &str) -> anyhow::Result<Tee> {
         "snp" => Tee::Snp,
         "tdx" => Tee::Tdx,
         "csv" => Tee::Csv,
+        #[cfg(feature = "sample-verifier")]
         "sample" => Tee::Sample,
         "az-snp-vtpm" => Tee::AzSnpVtpm,
         "cca" => Tee::Cca,
@@ -47,6 +48,20 @@ fn to_kbs_tee(tee: &str) -> anyhow::Result<Tee> {
     };
 
     Ok(tee)
+}
+
+fn attestation_evaluation_status(error: anyhow::Error) -> Status {
+    if attestation_service::is_verification_dependency_unavailable(&error) {
+        return Status::unavailable("Attestation verification dependency unavailable");
+    }
+
+    let error_stack = error
+        .chain()
+        .enumerate()
+        .map(|(i, cause)| format!("{i}: {cause}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Status::aborted(format!("Attestation evaluation failed: \n{error_stack}"))
 }
 
 #[derive(Error, Debug)]
@@ -198,15 +213,7 @@ impl AttestationService for Arc<RwLock<AttestationServer>> {
             .attestation_service
             .evaluate(verification_requests, policy_ids)
             .await
-            .map_err(|e| {
-                let error_stack = e
-                    .chain()
-                    .enumerate()
-                    .map(|(i, cause)| format!("{i}: {cause}"))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                Status::aborted(format!("Attestation evaluation failed: \n{error_stack}"))
-            })?;
+            .map_err(attestation_evaluation_status)?;
 
         debug!(token = attestation_token, "Attestation Token");
         info!("AttestationEvaluate succeeded.");
@@ -323,4 +330,47 @@ pub async fn start(socket: SocketAddr, config_path: Option<String>) -> Result<()
         .serve(socket)
         .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{attestation_evaluation_status, to_kbs_tee};
+
+    #[test]
+    fn dependency_unavailable_maps_to_generic_unavailable_status() {
+        let error =
+            anyhow::Error::new(attestation_service::VerificationDependencyUnavailable::new(
+                anyhow::anyhow!("sensitive KDS detail"),
+            ))
+            .context("Verifier evaluate failed");
+
+        let status = attestation_evaluation_status(error);
+
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+        assert!(!status.message().contains("sensitive KDS detail"));
+    }
+
+    #[test]
+    fn invalid_evidence_maps_to_aborted_status() {
+        let status = attestation_evaluation_status(anyhow::anyhow!("invalid evidence"));
+
+        assert_eq!(status.code(), tonic::Code::Aborted);
+    }
+
+    #[cfg(not(feature = "sample-verifier"))]
+    #[test]
+    fn production_feature_set_rejects_sample_tee() {
+        assert!(to_kbs_tee("sample").is_err());
+        #[cfg(feature = "snp-verifier")]
+        assert_eq!(to_kbs_tee("snp").unwrap(), attestation_service::Tee::Snp);
+    }
+
+    #[cfg(feature = "sample-verifier")]
+    #[test]
+    fn explicit_sample_feature_accepts_sample_tee() {
+        assert_eq!(
+            to_kbs_tee("sample").unwrap(),
+            attestation_service::Tee::Sample
+        );
+    }
 }
