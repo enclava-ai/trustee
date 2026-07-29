@@ -26,7 +26,7 @@ use std::{
     collections::HashMap,
     hash::Hash,
     result::Result::Ok,
-    sync::{LazyLock, OnceLock},
+    sync::{Arc, LazyLock, OnceLock},
 };
 use strum::{Display, EnumIter, EnumString, IntoEnumIterator};
 use tracing::{debug, instrument, warn};
@@ -107,6 +107,14 @@ fn init_cache_manager() -> MokaManager {
     MokaManager::new(MokaCacheBuilder::new(1024).build())
 }
 
+fn vcek_response_cache_mode(status: u16) -> CacheMode {
+    if status == StatusCode::OK.as_u16() {
+        CacheMode::ForceCache
+    } else {
+        CacheMode::NoStore
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Snp {
     verifier_config: SnpVerifierConfig,
@@ -122,11 +130,14 @@ impl Snp {
     fn build_vcek_client(&self) -> reqwest_middleware::ClientWithMiddleware {
         let client_options = HttpCacheOptions {
             cache_status_headers: true,
+            response_cache_mode_fn: Some(Arc::new(|_, response| {
+                Some(vcek_response_cache_mode(response.status))
+            })),
             ..Default::default()
         };
 
         let cache = Cache(HttpCache {
-            mode: CacheMode::Default,
+            mode: CacheMode::ForceCache,
             manager: VCEK_CACHE_MANAGER.get_or_init(init_cache_manager).clone(),
             options: client_options,
         });
@@ -736,6 +747,9 @@ pub(crate) fn get_processor_generation(
 mod tests {
     use super::*;
     use sev::parser::ByteParser;
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     const VCEK: &[u8; 1360] = include_bytes!("../../test_data/snp/test-vcek.der");
     const VCEK_LEGACY: &[u8; 1361] =
@@ -747,6 +761,43 @@ mod tests {
     const VLEK_REPORT: &[u8; 1184] = include_bytes!("../../test_data/snp/test-vlek-report.bin");
     const DYNAMIC_EVIDENCE: &[u8; 6714] =
         include_bytes!("../../../../attestation-service/tests/e2e/evidence.json");
+
+    async fn spawn_vcek_server(
+        statuses: Vec<StatusCode>,
+    ) -> (
+        String,
+        std::sync::Arc<AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = std::sync::Arc::new(AtomicUsize::new(0));
+        let request_counter = requests.clone();
+        let mut statuses = VecDeque::from(statuses);
+        let server = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut request = [0_u8; 4096];
+                stream.read(&mut request).await.unwrap();
+                request_counter.fetch_add(1, Ordering::SeqCst);
+                let status = statuses.pop_front().unwrap_or(StatusCode::OK);
+                let body = if status == StatusCode::OK {
+                    b"test-vcek".as_slice()
+                } else {
+                    b"unavailable".as_slice()
+                };
+                let response = format!(
+                    "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n",
+                    status.as_u16(),
+                    status.canonical_reason().unwrap_or("Unknown"),
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+                stream.write_all(body).await.unwrap();
+            }
+        });
+
+        (format!("http://{address}"), requests, server)
+    }
 
     #[test]
     fn kds_status_errors_have_exact_availability_classification() {
@@ -766,6 +817,74 @@ mod tests {
                 "https://kds.invalid"
             )));
         }
+    }
+
+    #[test]
+    fn vcek_cache_keeps_only_successful_responses() {
+        assert_eq!(vcek_response_cache_mode(200), CacheMode::ForceCache);
+        for status in [400, 404, 429, 500, 503] {
+            assert_eq!(vcek_response_cache_mode(status), CacheMode::NoStore);
+        }
+    }
+
+    #[tokio::test]
+    async fn successful_vcek_ignores_origin_no_cache() {
+        let (base_url, requests, server) =
+            spawn_vcek_server(vec![StatusCode::OK, StatusCode::INTERNAL_SERVER_ERROR]).await;
+        let SnpEvidence {
+            attestation_report: report,
+            ..
+        } = serde_json::from_slice(DYNAMIC_EVIDENCE).unwrap();
+        let proc_gen = get_processor_generation(&report).unwrap();
+        let verifier = Snp::default();
+
+        let first = verifier
+            .fetch_vcek_from_kds(report, &proc_gen, Some(base_url.clone()))
+            .await
+            .unwrap();
+        let SnpEvidence {
+            attestation_report: report,
+            ..
+        } = serde_json::from_slice(DYNAMIC_EVIDENCE).unwrap();
+        let second = verifier
+            .fetch_vcek_from_kds(report, &proc_gen, Some(base_url))
+            .await
+            .unwrap();
+
+        server.abort();
+        assert_eq!(first, b"test-vcek");
+        assert_eq!(second, b"test-vcek");
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn unavailable_vcek_response_is_not_cached() {
+        let (base_url, requests, server) =
+            spawn_vcek_server(vec![StatusCode::TOO_MANY_REQUESTS, StatusCode::OK]).await;
+        let SnpEvidence {
+            attestation_report: report,
+            ..
+        } = serde_json::from_slice(DYNAMIC_EVIDENCE).unwrap();
+        let proc_gen = get_processor_generation(&report).unwrap();
+        let verifier = Snp::default();
+
+        let error = verifier
+            .fetch_vcek_from_kds(report, &proc_gen, Some(base_url.clone()))
+            .await
+            .unwrap_err();
+        assert!(is_verification_dependency_unavailable(&error));
+        let SnpEvidence {
+            attestation_report: report,
+            ..
+        } = serde_json::from_slice(DYNAMIC_EVIDENCE).unwrap();
+        let second = verifier
+            .fetch_vcek_from_kds(report, &proc_gen, Some(base_url))
+            .await
+            .unwrap();
+
+        server.abort();
+        assert_eq!(second, b"test-vcek");
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
     }
 
     #[test]
