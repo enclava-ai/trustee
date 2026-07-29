@@ -361,12 +361,13 @@ mod tests {
     #[test]
     fn production_feature_set_rejects_sample_tee() {
         assert!(to_kbs_tee("sample").is_err());
+        #[cfg(feature = "snp-verifier")]
         assert_eq!(to_kbs_tee("snp").unwrap(), attestation_service::Tee::Snp);
     }
 
     #[cfg(feature = "sample-verifier")]
     #[test]
-    fn default_feature_set_accepts_sample_tee() {
+    fn explicit_sample_feature_accepts_sample_tee() {
         assert_eq!(
             to_kbs_tee("sample").unwrap(),
             attestation_service::Tee::Sample

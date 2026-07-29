@@ -323,7 +323,10 @@ fn aggregate_vcek_fetch_failures(mut failures: Vec<anyhow::Error>) -> anyhow::Er
 
 fn kds_status_error(status: StatusCode, vcek_url: &str) -> anyhow::Error {
     let source = anyhow!("Unable to fetch VCEK from URL: {status:?}, {vcek_url:?}");
-    if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+    if status == StatusCode::REQUEST_TIMEOUT
+        || status == StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error()
+    {
         VerificationDependencyUnavailable::new(source).into()
     } else {
         source
@@ -737,6 +740,7 @@ mod tests {
     #[test]
     fn kds_status_errors_have_exact_availability_classification() {
         for status in [
+            StatusCode::REQUEST_TIMEOUT,
             StatusCode::TOO_MANY_REQUESTS,
             StatusCode::INTERNAL_SERVER_ERROR,
         ] {

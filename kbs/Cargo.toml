@@ -18,7 +18,8 @@ coco-as = ["as"]
 # Use built-in CoCo-AS as backend attestation service
 coco-as-builtin = [
     "coco-as",
-    "attestation-service/default",
+    "attestation-service/grpc-bin",
+    "attestation-service/rvps-grpc",
     "attestation-service/all-verifier",
 ]
 

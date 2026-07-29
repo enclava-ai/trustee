@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
-default = ["grpc-bin", "rvps-grpc", "sample-verifier"]
+default = ["grpc-bin", "rvps-grpc"]
 all-verifier = ["verifier/all-verifier"]
 sample-verifier = ["verifier/sample-verifier"]
 tdx-verifier = ["verifier/tdx-verifier"]
