@@ -1,15 +1,9 @@
-name: Build and Push Enclava KBS Image
+name: Build and Push Enclava Trustee Runtime Images
 
 on:
   push:
     branches: [main]
-    tags: ["v*"]
   workflow_dispatch:
-    inputs:
-      version_tag:
-        description: "Optional additional image tag to publish, for example v0.1.0-enclava.1"
-        required: false
-        type: string
 
 permissions:
   contents: read
@@ -17,8 +11,25 @@ permissions:
   packages: write
 
 jobs:
-  build-kbs:
+  build-runtime:
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - component: KBS
+            dockerfile: kbs/docker/coco-as-grpc/Dockerfile
+            verifier: snp-verifier
+            image: ghcr.io/enclava-labs/trustee-kbs-grpc-as
+            digest_file: kbs-image-digest.txt
+            artifact: candidate-trustee-kbs-image-digest
+          - component: AS
+            dockerfile: attestation-service/docker/as-grpc/Dockerfile
+            verifier: snp-verifier
+            image: ghcr.io/enclava-labs/trustee-as-grpc
+            digest_file: as-image-digest.txt
+            artifact: candidate-trustee-as-image-digest
     steps:
       - name: Checkout code
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -35,59 +46,111 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Determine image tag
-        id: tag
-        env:
-          VERSION_TAG: ${{ github.event.inputs.version_tag }}
-        run: |
-          if [ -n "${VERSION_TAG}" ]; then
-            echo "tag=${VERSION_TAG}" >> "$GITHUB_OUTPUT"
-          elif [[ "${GITHUB_REF}" == refs/tags/* ]]; then
-            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
-          else
-            echo "tag=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Build and push KBS image
+      - name: Build and push ${{ matrix.component }} image
         id: image
+        env:
+          CANDIDATE_TAG: candidate-${{ github.sha }}
+          DIGEST_FILE: ${{ matrix.digest_file }}
+          DOCKERFILE: ${{ matrix.dockerfile }}
+          IMAGE_REPOSITORY: ${{ matrix.image }}
+          SOURCE_REPOSITORY: ${{ github.server_url }}/${{ github.repository }}
+          SOURCE_REVISION: ${{ github.sha }}
+          VERIFIER: ${{ matrix.verifier }}
         run: |
           docker buildx build --provenance false \
             --platform linux/amd64 \
-            -f kbs/docker/coco-as-grpc/Dockerfile \
+            -f "${DOCKERFILE}" \
             --build-arg BUILDPLATFORM=linux/amd64 \
             --build-arg ARCH=x86_64 \
+            --build-arg VERIFIER="${VERIFIER}" \
+            --label "org.opencontainers.image.source=${SOURCE_REPOSITORY}" \
+            --label "org.opencontainers.image.revision=${SOURCE_REVISION}" \
             --push \
-            --metadata-file /tmp/kbs-image-metadata.json \
-            -t ghcr.io/enclava-labs/trustee-kbs-grpc-as:${{ steps.tag.outputs.tag }} \
-            -t ghcr.io/enclava-labs/trustee-kbs-grpc-as:latest \
+            --metadata-file /tmp/image-metadata.json \
+            -t "${IMAGE_REPOSITORY}:${CANDIDATE_TAG}" \
             .
 
-          digest="$(jq -r '."containerimage.digest"' /tmp/kbs-image-metadata.json)"
+          digest="$(jq -r '."containerimage.digest"' /tmp/image-metadata.json)"
           if ! [[ "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
             echo "valid containerimage.digest missing from build metadata"
             exit 1
           fi
-          image_ref="ghcr.io/enclava-labs/trustee-kbs-grpc-as@${digest}"
-          printf '%s\n' "${image_ref}" > kbs-image-digest.txt
+          image_ref="${IMAGE_REPOSITORY}@${digest}"
+          printf '%s\n' "${image_ref}" > "${DIGEST_FILE}"
           echo "ref=${image_ref}" >> "$GITHUB_OUTPUT"
 
       - name: Install cosign
         uses: sigstore/cosign-installer@d58896d6a1865668819e1d91763c7751a165e159 # v3.9.2
 
       - name: Sign pushed digest
-        run: cosign sign --yes "${{ steps.image.outputs.ref }}"
+        env:
+          IMAGE_REF: ${{ steps.image.outputs.ref }}
+        run: cosign sign --yes "${IMAGE_REF}"
 
       - name: Verify pushed digest signature
+        env:
+          IMAGE_REF: ${{ steps.image.outputs.ref }}
         run: >-
           cosign verify
           --certificate-identity "https://github.com/${GITHUB_WORKFLOW_REF}"
           --certificate-oidc-issuer "https://token.actions.githubusercontent.com"
-          "${{ steps.image.outputs.ref }}"
+          "${IMAGE_REF}"
+
+      - name: Verify anonymous digest pull
+        env:
+          IMAGE_REF: ${{ steps.image.outputs.ref }}
+        run: |
+          anonymous_config="$(mktemp -d)"
+          trap 'rm -rf "${anonymous_config}"' EXIT
+          DOCKER_CONFIG="${anonymous_config}" \
+            docker buildx imagetools inspect "${IMAGE_REF}" >/dev/null
 
       - name: Upload verified immutable image reference
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
-          name: trustee-kbs-image-digest-${{ github.sha }}
-          path: kbs-image-digest.txt
+          name: ${{ matrix.artifact }}-${{ github.sha }}
+          path: ${{ matrix.digest_file }}
+          if-no-files-found: error
+          retention-days: 1
+
+  publish-release-evidence:
+    needs: build-runtime
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download KBS candidate evidence
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: candidate-trustee-kbs-image-digest-${{ github.sha }}
+          path: runtime-digests
+
+      - name: Download AS candidate evidence
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: candidate-trustee-as-image-digest-${{ github.sha }}
+          path: runtime-digests
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@d58896d6a1865668819e1d91763c7751a165e159 # v3.9.2
+
+      - name: Verify paired runtime evidence
+        run: |
+          kbs_ref="$(tr -d '\r\n' < runtime-digests/kbs-image-digest.txt)"
+          as_ref="$(tr -d '\r\n' < runtime-digests/as-image-digest.txt)"
+          [[ "${kbs_ref}" =~ ^ghcr\.io/enclava-labs/trustee-kbs-grpc-as@sha256:[0-9a-f]{64}$ ]]
+          [[ "${as_ref}" =~ ^ghcr\.io/enclava-labs/trustee-as-grpc@sha256:[0-9a-f]{64}$ ]]
+          for image_ref in "${kbs_ref}" "${as_ref}"; do
+            cosign verify \
+              --certificate-identity "https://github.com/${GITHUB_WORKFLOW_REF}" \
+              --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+              "${image_ref}" >/dev/null
+          done
+          printf 'kbs=%s\nas=%s\n' "${kbs_ref}" "${as_ref}" \
+            > trustee-runtime-images.txt
+
+      - name: Upload paired verified runtime evidence
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: trustee-runtime-image-digests-${{ github.sha }}
+          path: trustee-runtime-images.txt
           if-no-files-found: error
           retention-days: 90
