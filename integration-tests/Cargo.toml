@@ -27,7 +27,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [target.'cfg(not(any(target_arch = "s390x", target_arch = "aarch64")))'.dependencies]
-attestation-service = { path = "../attestation-service", features = ["sample-verifier"] }
+attestation-service = { path = "../attestation-service" }
 kbs-client = { path = "../tools/kbs-client" }
 
 [target.'cfg(target_arch = "s390x")'.dependencies]
@@ -35,7 +35,6 @@ attestation-service = { path = "../attestation-service", default-features = fals
     "snp-verifier",
     "nvidia-verifier",
     "se-verifier",
-    "sample-verifier",
 ] }
 kbs-client = { path = "../tools/kbs-client", default-features = false, features = [
     "se-attester",
@@ -44,8 +43,12 @@ kbs-client = { path = "../tools/kbs-client", default-features = false, features 
 [target.'cfg(target_arch = "aarch64")'.dependencies]
 attestation-service = { path = "../attestation-service", default-features = false, features = [
     "cca-verifier",
-    "sample-verifier",
 ] }
 kbs-client = { path = "../tools/kbs-client", default-features = false, features = [
     "cca-attester",
+] }
+
+[dev-dependencies]
+attestation-service = { path = "../attestation-service", default-features = false, features = [
+    "sample-verifier",
 ] }
