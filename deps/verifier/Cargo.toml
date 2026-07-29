@@ -6,6 +6,7 @@ edition = "2021"
 [features]
 default = ["all-verifier"]
 all-verifier = [
+    "sample-verifier",
     "tdx-verifier",
     "sgx-verifier",
     "snp-verifier",
@@ -18,6 +19,7 @@ all-verifier = [
     "nvidia-verifier",
     "tpm-verifier",
 ]
+sample-verifier = []
 tdx-verifier = ["eventlog", "scroll", "intel-tee-quote-verification-rs"]
 sgx-verifier = ["scroll", "intel-tee-quote-verification-rs"]
 az-snp-vtpm-verifier = [

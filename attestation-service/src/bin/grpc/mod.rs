@@ -35,6 +35,7 @@ fn to_kbs_tee(tee: &str) -> anyhow::Result<Tee> {
         "snp" => Tee::Snp,
         "tdx" => Tee::Tdx,
         "csv" => Tee::Csv,
+        #[cfg(feature = "sample-verifier")]
         "sample" => Tee::Sample,
         "az-snp-vtpm" => Tee::AzSnpVtpm,
         "cca" => Tee::Cca,
@@ -333,7 +334,7 @@ pub async fn start(socket: SocketAddr, config_path: Option<String>) -> Result<()
 
 #[cfg(test)]
 mod tests {
-    use super::attestation_evaluation_status;
+    use super::{attestation_evaluation_status, to_kbs_tee};
 
     #[test]
     fn dependency_unavailable_maps_to_generic_unavailable_status() {
@@ -354,5 +355,21 @@ mod tests {
         let status = attestation_evaluation_status(anyhow::anyhow!("invalid evidence"));
 
         assert_eq!(status.code(), tonic::Code::Aborted);
+    }
+
+    #[cfg(not(feature = "sample-verifier"))]
+    #[test]
+    fn production_feature_set_rejects_sample_tee() {
+        assert!(to_kbs_tee("sample").is_err());
+        assert_eq!(to_kbs_tee("snp").unwrap(), attestation_service::Tee::Snp);
+    }
+
+    #[cfg(feature = "sample-verifier")]
+    #[test]
+    fn default_feature_set_accepts_sample_tee() {
+        assert_eq!(
+            to_kbs_tee("sample").unwrap(),
+            attestation_service::Tee::Sample
+        );
     }
 }
