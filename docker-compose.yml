@@ -49,7 +49,10 @@ services:
       "/etc/as-config.json"
     ]
     depends_on:
-    - rvps
+      rvps:
+        condition: service_started
+      setup:
+        condition: service_completed_successfully
 
   rvps:
     build:
