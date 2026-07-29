@@ -4,9 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
-default = ["all-verifier"]
+default = ["all-verifier", "sample-verifier"]
 all-verifier = [
-    "sample-verifier",
     "tdx-verifier",
     "sgx-verifier",
     "snp-verifier",
