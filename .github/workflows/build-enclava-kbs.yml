@@ -11,7 +11,76 @@ permissions:
   packages: write
 
 jobs:
+  release-source-tests:
+    name: Release source tests (${{ matrix.component }})
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - component: SNP verifier
+            package: verifier
+            features: snp-verifier
+          - component: KBS gRPC AS
+            package: kbs
+            features: coco-as-grpc
+          - component: SNP gRPC AS
+            package: attestation-service
+            features: grpc-bin,rvps-grpc,snp-verifier
+    steps:
+      - name: Checkout exact release source
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Verify exact release source
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
+        run: test "$(git rev-parse HEAD)" = "${EXPECTED_SHA}"
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606 # v1.15.4
+        with:
+          components: rustfmt, clippy
+
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libprotobuf-dev
+
+      - name: Check formatting
+        if: matrix.package == 'verifier'
+        run: cargo fmt --all -- --check
+
+      - name: Lint release source
+        env:
+          FEATURES: ${{ matrix.features }}
+          PACKAGE: ${{ matrix.package }}
+        run: >-
+          cargo clippy --locked
+          -p "${PACKAGE}"
+          --lib
+          --bins
+          --no-default-features
+          --features "${FEATURES}"
+          -- -D warnings
+
+      - name: Test release source
+        env:
+          FEATURES: ${{ matrix.features }}
+          PACKAGE: ${{ matrix.package }}
+        run: >-
+          cargo test --locked
+          -p "${PACKAGE}"
+          --all-targets
+          --no-default-features
+          --features "${FEATURES}"
+
   build-runtime:
+    needs: release-source-tests
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     strategy:
@@ -34,6 +103,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
+          ref: ${{ github.sha }}
           persist-credentials: false
 
       - name: Set up Docker Buildx
