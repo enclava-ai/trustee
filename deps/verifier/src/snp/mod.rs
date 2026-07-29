@@ -406,6 +406,33 @@ impl Verifier for Snp {
             bail!("Unexpected attestation report version. Check SNP Firmware ABI specification");
         }
 
+        // Reject request-bound mismatches before consulting any endorsement
+        // dependency. Matching untrusted fields still proceeds through the
+        // complete certificate, signature, and TCB verification below.
+        if let ReportData::Value(expected_report_data) = expected_report_data {
+            debug!("Check the binding of REPORT_DATA.");
+            let expected_report_data: Vec<u8> =
+                regularize_data(expected_report_data, 64, "REPORT_DATA", "SNP");
+
+            if expected_report_data != report.report_data.to_vec() {
+                warn!(
+                    "Report data mismatch. Given: {}, Expected: {}",
+                    hex::encode(report.report_data),
+                    hex::encode(expected_report_data)
+                );
+                bail!("Report Data Mismatch");
+            }
+        };
+
+        if let InitDataHash::Value(expected_init_data_hash) = expected_init_data_hash {
+            debug!("Check the binding of HOST_DATA.");
+            let expected_init_data_hash =
+                regularize_data(expected_init_data_hash, 32, "HOST_DATA", "SNP");
+            if expected_init_data_hash != report.host_data.to_vec() {
+                bail!("Host Data Mismatch");
+            }
+        }
+
         // Get the processor model from the report
         let proc_gen: ProcessorGeneration = get_processor_generation(&report)?;
 
@@ -520,31 +547,6 @@ impl Verifier for Snp {
 
         if report.vmpl != 0 {
             bail!("VMPL Check Failed");
-        }
-
-        // Verify expected data
-        if let ReportData::Value(expected_report_data) = expected_report_data {
-            debug!("Check the binding of REPORT_DATA.");
-            let expected_report_data: Vec<u8> =
-                regularize_data(expected_report_data, 64, "REPORT_DATA", "SNP");
-
-            if expected_report_data != report.report_data.to_vec() {
-                warn!(
-                    "Report data mismatch. Given: {}, Expected: {}",
-                    hex::encode(report.report_data),
-                    hex::encode(expected_report_data)
-                );
-                bail!("Report Data Mismatch");
-            }
-        };
-
-        if let InitDataHash::Value(expected_init_data_hash) = expected_init_data_hash {
-            debug!("Check the binding of HOST_DATA.");
-            let expected_init_data_hash =
-                regularize_data(expected_init_data_hash, 32, "HOST_DATA", "SNP");
-            if expected_init_data_hash != report.host_data.to_vec() {
-                bail!("Host Data Mismatch");
-            }
         }
 
         let claims_map = parse_tee_evidence(&report);
@@ -782,6 +784,36 @@ mod tests {
         let aggregate = aggregate_vcek_fetch_failures(Vec::new());
 
         assert!(!is_verification_dependency_unavailable(&aggregate));
+    }
+
+    #[tokio::test]
+    async fn report_data_mismatch_preempts_unavailable_kds() {
+        let SnpEvidence {
+            attestation_report: report,
+            ..
+        } = serde_json::from_slice(DYNAMIC_EVIDENCE).unwrap();
+        let mut mismatched_report_data = report.report_data.to_vec();
+        mismatched_report_data[0] ^= 1;
+        let evidence = serde_json::to_value(SnpEvidence::new(report, None)).unwrap();
+        let verifier = Snp::new(Some(SnpVerifierConfig {
+            vcek_sources: vec![VCEKSource::KDS {
+                base_url: Some("not-a-valid-kds-url".to_string()),
+            }],
+        }))
+        .await
+        .unwrap();
+
+        let error = verifier
+            .evaluate(
+                evidence,
+                &ReportData::Value(&mismatched_report_data),
+                &InitDataHash::NotProvided,
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.to_string(), "Report Data Mismatch");
+        assert!(!is_verification_dependency_unavailable(&error));
     }
 
     #[test]
