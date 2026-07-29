@@ -27,6 +27,7 @@ jobs:
 
       - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
+          name: kbs-source-archive
           path: ./kbs.tar.gz
 
   # Sample TEE e2e (reuses kbs-e2e template)
@@ -102,11 +103,9 @@ jobs:
           - instance: ubuntu-24.04
             build_platform: linux/amd64
             target_arch: x86_64
-            verifier: all-verifier
           - instance: ubuntu-24.04-arm
             build_platform: linux/arm64
             target_arch: aarch64
-            verifier: cca-verifier
     runs-on: ${{ matrix.instance }}
     permissions:
       contents: read
@@ -138,7 +137,6 @@ jobs:
         env:
           BUILD_PLATFORM: ${{ matrix.build_platform }}
           TARGET_ARCH: ${{ matrix.target_arch }}
-          VERIFIER: ${{ matrix.verifier }}
         run: make test-kbs-docker-e2e
 
   # Azure vTPM TEE e2e (manual trigger only)

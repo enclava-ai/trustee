@@ -69,7 +69,7 @@ test-kbs-docker-e2e:
 	cp $(CURDIR)/kbs/config/docker-compose/kbs-config.toml $$E2E_DIR/kbs/config/docker-compose/ && \
 	openssl genpkey -algorithm ed25519 > $$E2E_DIR/kbs/config/private.key && \
 	openssl pkey -in $$E2E_DIR/kbs/config/private.key -pubout -out $$E2E_DIR/kbs/config/public.pub && \
-	docker compose -f $(CURDIR)/docker-compose.yml build --build-arg BUILDPLATFORM="$${BUILD_PLATFORM:-linux/amd64}" --build-arg ARCH="$${TARGET_ARCH:-x86_64}" --build-arg VERIFIER="$${VERIFIER:-all-verifier}" && \
+	docker compose -f $(CURDIR)/docker-compose.yml build --build-arg BUILDPLATFORM="$${BUILD_PLATFORM:-linux/amd64}" --build-arg ARCH="$${TARGET_ARCH:-x86_64}" --build-arg VERIFIER=sample-verifier && \
 	docker compose -f $(CURDIR)/docker-compose.yml --project-directory $$E2E_DIR up -d && \
 	cd $(CURDIR)/target/release && \
 	echo "shhhhh" > test-secret && \
