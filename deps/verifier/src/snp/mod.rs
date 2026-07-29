@@ -181,9 +181,15 @@ impl Snp {
         let hw_id = self.parse_hw_id_from_vcek(att_report, proc_gen.clone());
         let vcek_path = format!("{}/vcek/{}/vcek.der", path, hw_id);
         let vcek_bytes = std::fs::read(&vcek_path).map_err(|source| {
-            VerificationDependencyUnavailable::new(anyhow::Error::new(source).context(format!(
+            let missing = source.kind() == std::io::ErrorKind::NotFound;
+            let source = anyhow::Error::new(source).context(format!(
                 "Failed to read VCEK from offline store at {vcek_path}"
-            )))
+            ));
+            if missing {
+                source
+            } else {
+                VerificationDependencyUnavailable::new(source).into()
+            }
         })?;
         Ok(vcek_bytes)
     }
@@ -259,9 +265,14 @@ impl Snp {
                 .send()
                 .await
                 .map_err(|source| {
-                    VerificationDependencyUnavailable::new(
-                        anyhow::Error::new(source).context("Unable to send request for VCEK"),
-                    )
+                    let unavailable = source.is_connect() || source.is_timeout();
+                    let source =
+                        anyhow::Error::new(source).context("Unable to send request for VCEK");
+                    if unavailable {
+                        VerificationDependencyUnavailable::new(source).into()
+                    } else {
+                        source
+                    }
                 })?;
 
         let duration = start.elapsed();
@@ -788,6 +799,43 @@ mod tests {
         let aggregate = aggregate_vcek_fetch_failures(Vec::new());
 
         assert!(!is_verification_dependency_unavailable(&aggregate));
+    }
+
+    #[test]
+    fn missing_offline_vcek_is_invalid() {
+        let SnpEvidence {
+            attestation_report: report,
+            ..
+        } = serde_json::from_slice(DYNAMIC_EVIDENCE).unwrap();
+        let proc_gen = get_processor_generation(&report).unwrap();
+        let missing_root =
+            std::env::temp_dir().join(format!("trustee-missing-vcek-{}", std::process::id()));
+
+        let error = Snp::default()
+            .fetch_vcek_from_offline_store(
+                report,
+                &proc_gen,
+                Some(missing_root.to_string_lossy().into_owned()),
+            )
+            .unwrap_err();
+
+        assert!(!is_verification_dependency_unavailable(&error));
+    }
+
+    #[tokio::test]
+    async fn malformed_kds_url_is_invalid() {
+        let SnpEvidence {
+            attestation_report: report,
+            ..
+        } = serde_json::from_slice(DYNAMIC_EVIDENCE).unwrap();
+        let proc_gen = get_processor_generation(&report).unwrap();
+
+        let error = Snp::default()
+            .fetch_vcek_from_kds(report, &proc_gen, Some("not-a-valid-kds-url".to_string()))
+            .await
+            .unwrap_err();
+
+        assert!(!is_verification_dependency_unavailable(&error));
     }
 
     #[tokio::test]
